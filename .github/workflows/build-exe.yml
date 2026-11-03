@@ -1,0 +1,24 @@
+# Положите этот файл в репозиторий GitHub по пути .github/workflows/build-exe.yml
+# вместе с launcher.py и ueban.ico. Затем: вкладка Actions → Build exe → Run workflow,
+# готовый UebanLauncher.exe скачивается из раздела Artifacts. На вашем ПК ничего ставить не нужно.
+name: Build exe
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - name: Build exe
+        shell: pwsh
+        run: |
+          $extra = @()
+          if (Test-Path "ueban.ico") { $extra += "--icon=ueban.ico" }
+          pyinstaller --noconsole --onefile --clean --name UebanLauncher @extra launcher.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UebanLauncher
+          path: dist/UebanLauncher.exe
