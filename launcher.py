@@ -1583,6 +1583,52 @@ if tk is not None:
                 size -= 1
             self.create_text(w / 2, (y0 + y1) / 2 - 1, text=label, fill=fg, font=f)
 
+    class PixelFrame(tk.Frame):
+        """Карточка в пиксельном стиле кнопок: срезанные ступенчатые углы, светлая кромка сверху,
+        тёмная плашка снизу. Ведёт себя как обычный Frame: дочерние виджеты кладём прямо в неё."""
+
+        def __init__(self, master, fill=None, edge=None, accent=None, step=6, **kw):
+            self._fill = fill or C["card"]
+            self._edge = edge or C["line"]
+            self._accent = accent
+            self._n = step
+            self._pbg = master.cget("bg")
+            kw.setdefault("padx", 16)
+            kw.setdefault("pady", 14)
+            cur = kw.get("cursor", "")
+            super().__init__(master, bg=self._fill, **kw)
+            self.cv = tk.Canvas(self, bg=self._pbg, highlightthickness=0, bd=0, cursor=cur)
+            self.cv.place(x=0, y=0, relwidth=1, relheight=1)
+            self.cv.bind("<Configure>", lambda e: self._redraw())
+
+        def set_edge(self, color):
+            self._edge = color
+            self._redraw()
+
+        def _redraw(self):
+            cv = self.cv
+            w, h = cv.winfo_width(), cv.winfo_height()
+            if w < 24 or h < 24:
+                return
+            cv.delete("all")
+            n = self._n
+            fill, edge = self._fill, self._edge
+            top = self._accent or _mix(edge, "#ffffff", 0.14)
+            lo = _mix(fill, "#000000", 0.45)
+            side = max(1, round(n / 3))
+            px = max(2, round(n / 2))
+            cv.create_polygon(0, n, n, n, n, 0, w - n, 0, w - n, n, w, n,
+                              w, h - n, w - n, h - n, w - n, h, n, h, n, h - n, 0, h - n,
+                              fill=fill, outline="")
+            cr = cv.create_rectangle
+            cr(n, 0, w - n, 3 if self._accent else 2, fill=top, outline="")        # верхняя кромка
+            cr(n, h - 3, w - n, h, fill=lo, outline="")                            # нижняя плашка
+            cr(0, n, side, h - n, fill=edge, outline="")                           # левый край
+            cr(w - side, n, w, h - n, fill=edge, outline="")                       # правый край
+            for x in (n, w - n - px):                                              # угловые «пиксели»
+                cr(x, n, x + px, n + px, fill=top, outline="")
+                cr(x, h - n - px, x + px, h - n, fill=lo, outline="")
+
     class ToggleSwitch(tk.Frame):
         """Переключатель: бегунок плавно скользит, цвет перетекает."""
 
@@ -1787,17 +1833,16 @@ if tk is not None:
                 col = _mix(self._grad(px), "#ffffff", 0.35)
                 self._items.append(self.create_rectangle(0, 0, 1, 1, fill=col, outline="", tags="px"))
             self._move()
-            r = 14
-            for sx, sy in ((0, 0), (1, 0), (0, 1), (1, 1)):     # скругление углов
-                pts = [(0, 0), (r, 0)]
-                for k in range(9):
-                    a = math.radians(270 - 90 * k / 8)
-                    pts.append((r + r * math.cos(a), r + r * math.sin(a)))
-                pts.append((0, r))
-                flat = []
-                for x, y in pts:
-                    flat += [(w - x) if sx else x, (h - y) if sy else y]
-                self.create_polygon(flat, fill=self._pbg, outline="")
+            for i in range(n):                                      # кромки как у кнопок
+                x = i * step
+                col = self._grad(i / max(1, n - 1))
+                self.create_rectangle(x, 0, x + step + 1, 3, fill=_mix(col, "#ffffff", 0.28), outline="")
+                self.create_rectangle(x, h - 4, x + step + 1, h, fill=_mix(col, "#000000", 0.40), outline="")
+            c = 6
+            for sx, sy in ((0, 0), (1, 0), (0, 1), (1, 1)):     # срезанные ступенчатые углы
+                x0 = w - c if sx else 0
+                y0 = h - c if sy else 0
+                self.create_rectangle(x0, y0, x0 + c, y0 + c, fill=self._pbg, outline="")
             ty = h / 2 - (10 if self._sub else 0)
             if self._big:
                 ty = h / 2 - 18
@@ -2184,7 +2229,7 @@ class App:
                 w.bind("<Leave>", lambda e, k=key: self._nav_hover(k, False))
             self.nav[key] = (row, bar, lab, ico)
         # профиль внизу: клик ведёт в «Аккаунты»
-        card = tk.Frame(sb, bg=C["card"], highlightbackground=C["line"], highlightthickness=1, cursor="hand2")
+        card = PixelFrame(sb, step=4, padx=0, pady=0, cursor="hand2")
         card.pack(side="bottom", fill="x", padx=14, pady=(0, 16))
         self.av = tk.Canvas(card, width=44, height=44, bg=C["card"], highlightthickness=0, cursor="hand2")
         self.av.pack(side="left", padx=(10, 8), pady=10)
@@ -2196,7 +2241,7 @@ class App:
         self.prof_type = tk.Label(col, text="", bg=C["card"], fg=C["muted"], font=font(9), anchor="w",
                                   cursor="hand2")
         self.prof_type.pack(fill="x")
-        for w in (card, self.av, col, self.prof_name, self.prof_type):
+        for w in (card, card.cv, self.av, col, self.prof_name, self.prof_type):
             w.bind("<Button-1>", lambda e: self.show_page("accounts"))
         PixelButton(sb, "Папка Minecraft", self.open_minecraft_folder, width=222, height=34, fs=10,
                     bg=C["bg0"]).pack(side="bottom", pady=(0, 8))
@@ -2300,8 +2345,7 @@ class App:
 
     # ───── помощники ─────
     def _section(self, parent, title):
-        f = tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
-                     padx=16, pady=14)
+        f = PixelFrame(parent, padx=18, pady=16)
         tk.Label(f, text=title, bg=C["card"], fg=C["yellow"], font=font(12, True)).pack(anchor="w")
         tk.Frame(f, bg=C["line"], height=1).pack(fill="x", pady=(6, 10))
         return f
@@ -2352,26 +2396,23 @@ class App:
 
     # --- главная
     def _card(self, parent, **kw):
-        return tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
-                        padx=16, pady=14, **kw)
+        return PixelFrame(parent, padx=18, pady=16, **kw)
 
     def _tile(self, parent, key, title, accent, on_click):
-        card = tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
-                        cursor="hand2")
-        tk.Frame(card, bg=accent, height=3).pack(fill="x")
+        card = PixelFrame(parent, accent=accent, padx=0, pady=0, cursor="hand2")
         inner = tk.Frame(card, bg=C["card"], cursor="hand2")
-        inner.pack(fill="both", expand=True, padx=16, pady=(11, 14))
+        inner.pack(fill="both", expand=True, padx=18, pady=(14, 14))
         cap = tk.Label(inner, text=title.upper(), bg=C["card"], fg=C["muted"], font=font(9, True),
                        anchor="w", cursor="hand2")
         cap.pack(anchor="w")
         val = tk.Label(inner, text="", bg=C["card"], fg=C["text"], font=font(12, True), anchor="w",
                        justify="left", wraplength=220, cursor="hand2")
         val.pack(anchor="w", fill="x", pady=(5, 0))
-        card.bind("<Configure>", lambda e, v=val: v.configure(wraplength=max(120, e.width - 40)))
-        for w in (card, inner, cap, val):
+        card.bind("<Configure>", lambda e, v=val: v.configure(wraplength=max(120, e.width - 44)))
+        for w in (card, card.cv, inner, cap, val):
             w.bind("<Button-1>", lambda e: on_click())
-            w.bind("<Enter>", lambda e: card.configure(highlightbackground=accent))
-            w.bind("<Leave>", lambda e: card.configure(highlightbackground=C["line"]))
+            w.bind("<Enter>", lambda e: card.set_edge(accent))
+            w.bind("<Leave>", lambda e: card.set_edge(C["line"]))
         self.sum[key] = val
         return card
 
@@ -2737,7 +2778,7 @@ class App:
                          else "Ничего не найдено — попробуйте другой запрос или снимите фильтр версии")
 
     def _result_row(self, body, it):
-        row = tk.Frame(body, bg=C["card"], highlightbackground=C["line"], highlightthickness=1)
+        row = PixelFrame(body, step=4, padx=0, pady=0)
         row.pack(fill="x", pady=4, padx=(0, 6))
         row.columnconfigure(0, weight=1)
         info = tk.Frame(row, bg=C["card"])
@@ -2791,7 +2832,7 @@ class App:
             return
         for f in files:
             off = f.name.endswith(".disabled")
-            row = tk.Frame(body, bg=C["card"], highlightbackground=C["line"], highlightthickness=1)
+            row = PixelFrame(body, step=4, padx=0, pady=0)
             row.pack(fill="x", pady=3, padx=(0, 6))
             tk.Label(row, text=("[выкл]  " if off else "") + f.name.replace(".disabled", ""), bg=C["card"],
                      fg=C["muted"] if off else C["text"], font=font(10), anchor="w").pack(
