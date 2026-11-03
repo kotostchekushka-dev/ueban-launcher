@@ -11,6 +11,7 @@ Ueban Launcher — лаунчер Minecraft Java Edition (офлайн-режи�
 """
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
@@ -39,6 +40,11 @@ except ImportError:  # для тестов без GUI
 APP_NAME = "Ueban Launcher"
 APP_VERSION = "3.0"
 UA = f"UebanLauncher/{APP_VERSION}"
+# Microsoft Client ID приложения лаунчера. Если вписать его сюда (один раз, разработчиком),
+# пользователям не придётся ничего вводить: вход через Microsoft заработает сразу.
+# Как получить: portal.azure.com → App registrations → New registration (Personal accounts,
+# Allow public client flows = Yes), затем одобрить ID у Mojang: https://aka.ms/mce-reviewappid
+DEFAULT_MS_CLIENT_ID = ""
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 JAVA_ALL_URL = ("https://launchermeta.mojang.com/v1/products/java-runtime/"
@@ -1012,7 +1018,7 @@ def ms_account_from_tokens(client_id, tok):
 def ms_refresh_if_needed(acct, cfg, log):
     if acct.get("access_token") and time.time() < acct.get("expires", 0):
         return
-    cid = acct.get("client_id") or cfg.get("ms_client_id")
+    cid = acct.get("client_id") or cfg.get("ms_client_id") or DEFAULT_MS_CLIENT_ID
     if not cid or not acct.get("refresh_token"):
         raise AuthError("Войдите в Microsoft-аккаунт заново (вкладка «Аккаунты»)")
     log("Обновляю вход Microsoft...")
@@ -1292,23 +1298,23 @@ def prepare_and_launch(cfg, target, account, log, progress, manifest=None, on_st
 # ═════════════════════════════ ИНТЕРФЕЙС ═════════════════════════════
 
 C = {
-    "bg0": "#070e24",     # самый тёмный синий (панели)
-    "bg1": "#0d1838",     # основной фон страниц
-    "bg2": "#17275a",     # выделение
-    "hover": "#101d45",
-    "input": "#050a1c",
-    "line": "#2b4a9b",
-    "text": "#eaf1ff",
-    "muted": "#8ea6dc",
-    "yellow": "#ffc61a",
-    "yellow_hi": "#ffe98a",
-    "yellow_lo": "#cf8a00",
-    "orange": "#ff8a00",
-    "brown": "#3b2300",
+    "bg0": "#0a0c13",     # самый тёмный (панели, фон)
+    "bg1": "#10131c",     # основной фон страниц
+    "bg2": "#1a1f2e",     # выделение
+    "hover": "#151927",
+    "input": "#0b0d14",
+    "line": "#272d42",
+    "text": "#eef0f6",
+    "muted": "#8b93a9",
+    "yellow": "#ffb020",      # акцентный цвет
+    "yellow_hi": "#ffd36b",
+    "yellow_lo": "#e8890c",
+    "orange": "#ff8a1f",
+    "brown": "#1a1205",       # текст на акцентной кнопке
     "red": "#ff7b7b",
-    "green": "#8dffa8",
+    "green": "#6ee7a0",
 }
-FONT = "Consolas"
+FONT = "Segoe UI" if IS_WIN else "Helvetica"
 
 
 def font(size=10, bold=False):
@@ -1332,84 +1338,143 @@ def grad_color(t):
 
 if tk is not None:
 
+    def _mix(c1, c2, t):
+        """Смешать два цвета #rrggbb (t от 0 до 1)."""
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(int(a[k] + (b[k] - a[k]) * t) for k in range(3))
+
+    def _ease(t):
+        return 1 - (1 - t) ** 3
+
+    def _rrect(cv, x0, y0, x1, y1, r, **kw):
+        r = max(0, min(r, (x1 - x0) / 2, (y1 - y0) / 2))
+        pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+               x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+        return cv.create_polygon(pts, smooth=True, splinesteps=12, **kw)
+
+    def _nice(text):
+        """ВЕРХНИЙ РЕГИСТР → обычный (Первая буква заглавная, латинские слова с заглавной)."""
+        if not text or not text.isupper():
+            return text
+        out, first = [], True
+        for w in text.lower().split(" "):
+            if w and all(ord(ch) < 128 for ch in w) and any(ch.isalpha() for ch in w):
+                w = w[:1].upper() + w[1:] if not w.startswith("+") else w
+                if w.startswith("."):
+                    w = w
+            out.append(w)
+        s = " ".join(out)
+        for i, ch in enumerate(s):
+            if ch.isalpha():
+                s = s[:i] + ch.upper() + s[i + 1:]
+                break
+        return s
+
     class AnimatedBG(tk.Canvas):
-        """Фон: диагональные полосы, цвета которых плавно «перетекают» жёлтый → оранжевый."""
+        """Фон: тёмный градиент и мягкие светящиеся шары, которые медленно плывут."""
+        ORBS = [("#ff8a1f", 0.30, 0.00, 0.9, 0.7, 0.8), ("#ffb020", 0.22, 1.9, 0.7, 1.1, 0.6),
+                ("#7a5cff", 0.26, 3.7, 1.1, 0.8, 0.5)]
 
         def __init__(self, master):
-            super().__init__(master, highlightthickness=0, bd=0, bg="#ffa000")
+            super().__init__(master, highlightthickness=0, bd=0, bg=C["bg0"])
             self.enabled = True
             self.step = 0.0035
-            self._ids = []
-            self._phase = 0.0
+            self._t = 0.0
+            self._rings = []
             self._dims = (0, 0)
-            self._count = 80
             self.bind("<Configure>", self._on_resize)
             self.after(50, self._tick)
 
         def _on_resize(self, e):
-            w, h = e.width, e.height
-            if (w, h) == self._dims or w < 10 or h < 10:
+            if (e.width, e.height) == self._dims or e.width < 10 or e.height < 10:
                 return
-            self._dims = (w, h)
-            self.delete("gradient")
-            self._ids = []
-            skew = h * 0.55
-            sw = (w + skew) / self._count
-            for i in range(self._count):
-                x0 = i * sw - skew
-                pts = [x0 + skew, 0, x0 + skew + sw + 2, 0, x0 + sw + 2, h, x0, h]
-                self._ids.append(self.create_polygon(pts, fill="#ffa000", outline="", tags="gradient"))
-            self.tag_lower("gradient")
+            self._dims = (e.width, e.height)
+            self.delete("orb")
+            self._rings = []
+            base = C["bg0"]
+            for col, size, *_ in self.ORBS:
+                ids = []
+                for k in range(9):
+                    t = k / 8
+                    ids.append(self.create_oval(0, 0, 1, 1, outline="", tags="orb",
+                                                fill=_mix(base, col, 0.06 + 0.30 * t * t)))
+                self._rings.append(ids)
+            self.tag_lower("orb")
             self._paint()
 
         def _paint(self):
-            n = len(self._ids) or 1
-            for i, item in enumerate(self._ids):
-                self.itemconfigure(item, fill=grad_color(self._phase + i / n * 0.8))
+            w, h = self._dims
+            for (col, size, ph, fx, fy, _a), ids in zip(self.ORBS, self._rings):
+                cx = w * (0.5 + 0.42 * math.sin(self._t * fx + ph))
+                cy = h * (0.45 + 0.38 * math.cos(self._t * fy + ph * 1.3))
+                R = max(w, h) * size
+                n = len(ids)
+                for k, item in enumerate(ids):
+                    r = R * (1 - k / n)
+                    self.coords(item, cx - r, cy - r, cx + r, cy + r)
 
         def _tick(self):
             try:
-                if self.enabled and self._ids and self.winfo_viewable():
-                    self._phase = (self._phase + self.step) % 1.0
+                if self.enabled and self._rings and self.winfo_viewable():
+                    self._t += self.step * 9
                     self._paint()
             finally:
-                self.after(45, self._tick)
+                self.after(40, self._tick)
 
-    BUTTON_PAL = dict(fill="#ffc61a", hi="#ffe98a", lo="#cf8a00", fg="#3b2300", sh="#fff0a8")
-    BUTTON_OFF = dict(fill="#8a7a4a", hi="#a39467", lo="#5d5130", fg="#3a3322", sh="#b5a77a")
+    class AnimButton(tk.Canvas):
+        """Скруглённая кнопка: плавная смена цвета при наведении, «нажатие» и мягкая пульсация."""
+        PRIMARY = ("ИГРАТЬ", "ВОЙТИ", "СОЗДАТЬ", "ИСКАТЬ", "СКАЧАТЬ", "ДОБАВИТЬ", "ИСПОЛЬЗОВАТЬ",
+                   "СОХРАНИТЬ И ВОЙТИ", "ВЫБРАТЬ ДЛЯ ИГРЫ", "ВКЛЮЧИТЬ")
 
-    class PixelButton(tk.Canvas):
-        """Кнопка в стиле Minecraft-лаунчера: чёрная рамка, светлая «фаска» сверху/слева, тёмная снизу/справа."""
-
-        def __init__(self, master, text, command, width=170, height=40, fs=11, bg=None):
+        def __init__(self, master, text, command, width=170, height=40, fs=11, bg=None, kind=None, pulse=False):
             super().__init__(master, width=width, height=height, bg=bg or C["bg1"],
                              highlightthickness=0, bd=0, cursor="hand2")
             self._label = text
             self._cmd = command
             self._bw, self._bh, self._fs = width, height, fs
-            self._hover = False
-            self._down = False
+            self._primary = (kind == "primary") if kind else (text.upper() in self.PRIMARY)
+            self._pulse = pulse
+            self._hover = self._down = False
             self._enabled = True
-            self.bind("<Enter>", lambda e: self._state(hover=True))
-            self.bind("<Leave>", lambda e: self._state(hover=False, down=False))
+            self._h = 0.0          # 0..1 — степень «наведения»
+            self._tgt = 0.0
+            self._ph = 0.0
+            self._job = None
+            self.bind("<Enter>", lambda e: self._go(1.0, hover=True))
+            self.bind("<Leave>", lambda e: self._go(0.0, hover=False, down=False))
             self.bind("<ButtonPress-1>", self._press)
             self.bind("<ButtonRelease-1>", self._release)
             self._draw()
+            if pulse:
+                self.after(60, self._pulse_tick)
 
-        def _state(self, **kw):
-            if "hover" in kw:
-                self._hover = kw["hover"]
-            if "down" in kw:
-                self._down = kw["down"]
+        def _go(self, tgt, **kw):
+            self._hover = kw.get("hover", self._hover)
+            self._down = kw.get("down", self._down)
+            self._tgt = tgt
+            if self._job is None:
+                self._anim()
+
+        def _anim(self):
+            d = self._tgt - self._h
+            if abs(d) < 0.02:
+                self._h = self._tgt
+                self._job = None
+            else:
+                self._h += d * 0.3
+                self._job = self.after(16, self._anim)
             self._draw()
 
         def _press(self, e):
             if self._enabled:
-                self._state(down=True)
+                self._down = True
+                self._draw()
 
         def _release(self, e):
             was = self._down
-            self._state(down=False)
+            self._down = False
+            self._draw()
             if was and self._enabled and self._hover and self._cmd:
                 self._cmd()
 
@@ -1422,45 +1487,57 @@ if tk is not None:
             self.configure(cursor="hand2" if flag else "arrow")
             self._draw()
 
-        def _draw(self):
-            pal = dict(BUTTON_PAL if self._enabled else BUTTON_OFF)
-            if self._enabled and self._hover and not self._down:
-                pal["fill"], pal["hi"] = "#ffd64d", "#fff3b8"
-            w, h = self._bw, self._bh
-            self.delete("all")
-            self.create_rectangle(0, 0, w, h, fill="#000000", outline="")
-            self.create_rectangle(2, 2, w - 2, h - 2, fill=pal["fill"], outline="")
-            if self._down and self._enabled:
-                self.create_rectangle(2, 2, w - 2, 6, fill=pal["lo"], outline="")
-                self.create_rectangle(2, 2, 6, h - 2, fill=pal["lo"], outline="")
-            else:
-                self.create_rectangle(2, 2, w - 2, 5, fill=pal["hi"], outline="")
-                self.create_rectangle(2, 2, 5, h - 2, fill=pal["hi"], outline="")
-                self.create_rectangle(2, h - 6, w - 2, h - 2, fill=pal["lo"], outline="")
-                self.create_rectangle(w - 5, 2, w - 2, h - 2, fill=pal["lo"], outline="")
-            off = 2 if (self._down and self._enabled) else 0
-            f = font(self._fs, True)
-            cx, cy = w / 2 + off, h / 2 + off - 1
-            self.create_text(cx + 1, cy + 2, text=self._label, fill=pal["sh"], font=f)
-            self.create_text(cx, cy, text=self._label, fill=pal["fg"], font=f)
+        def _pulse_tick(self):
+            try:
+                if self._enabled and self.winfo_viewable():
+                    self._ph += 0.08
+                    self._draw()
+            finally:
+                self.after(50, self._pulse_tick)
 
-    class PixelCheck(tk.Frame):
-        """Квадратный пиксельный чекбокс с жёлтой галочкой."""
-        CHECK = [(1, 3), (1, 4), (2, 4), (2, 5), (3, 4), (3, 3), (4, 3), (4, 2), (5, 2), (5, 1)]
+        def _draw(self):
+            w, h = self._bw, self._bh
+            bgc = self.cget("bg")
+            self.delete("all")
+            if self._primary:
+                base, top, fg = C["yellow"], C["yellow_hi"], C["brown"]
+                if not self._enabled:
+                    base, fg = _mix(C["bg2"], C["muted"], 0.25), C["muted"]
+            else:
+                base, top, fg = C["bg2"], C["line"], C["text"]
+                if not self._enabled:
+                    fg = C["muted"]
+            col = _mix(base, top, 0.55 * self._h) if self._enabled else base
+            inset = 1.5 if (self._down and self._enabled) else 0
+            if self._primary and self._enabled and self._pulse and not self._hover:
+                g = (math.sin(self._ph) + 1) / 2
+                _rrect(self, 0, 0, w, h, 14, fill=_mix(bgc, C["yellow"], 0.10 + 0.22 * g), outline="")
+            elif self._primary and self._enabled and self._h > 0:
+                _rrect(self, 0, 0, w, h, 14, fill=_mix(bgc, C["yellow"], 0.28 * self._h), outline="")
+            _rrect(self, 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset, 11, fill=col, outline="")
+            if not self._primary:
+                _rrect(self, 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset, 11, fill="",
+                       outline=_mix(C["line"], C["yellow"], self._h) if self._enabled else C["line"])
+            f = font(self._fs, True)
+            self.create_text(w / 2, h / 2 + inset - 1, text=_nice(self._label), fill=fg, font=f)
+
+    class ToggleSwitch(tk.Frame):
+        """Переключатель: бегунок плавно скользит, цвет перетекает."""
 
         def __init__(self, master, text, variable, command=None, bg=None):
             bg = bg or C["bg1"]
             super().__init__(master, bg=bg, cursor="hand2")
-            self._var = variable
-            self._cmd = command
-            self._box = tk.Canvas(self, width=22, height=22, bg=bg, highlightthickness=0, bd=0,
-                                  cursor="hand2")
+            self._var, self._cmd, self._bgc = variable, command, bg
+            self._x = 1.0 if variable.get() else 0.0
+            self._job = None
+            self._box = tk.Canvas(self, width=44, height=24, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
             self._box.pack(side="left")
-            self._lbl = tk.Label(self, text=text, bg=bg, fg=C["text"], font=font(10), cursor="hand2")
-            self._lbl.pack(side="left", padx=(8, 0))
+            self._lbl = tk.Label(self, text=text, bg=bg, fg=C["text"], font=font(10), cursor="hand2",
+                                 anchor="w", justify="left", wraplength=330)
+            self._lbl.pack(side="left", padx=(10, 0))
             for w in (self, self._box, self._lbl):
                 w.bind("<Button-1>", self._toggle)
-            variable.trace_add("write", lambda *a: self._draw())
+            variable.trace_add("write", lambda *a: self._start())
             self._draw()
 
         def _toggle(self, e=None):
@@ -1468,29 +1545,58 @@ if tk is not None:
             if self._cmd:
                 self._cmd()
 
+        def _start(self):
+            if self._job is None:
+                self._step()
+
+        def _step(self):
+            tgt = 1.0 if self._var.get() else 0.0
+            d = tgt - self._x
+            if abs(d) < 0.03:
+                self._x, self._job = tgt, None
+            else:
+                self._x += d * 0.35
+                self._job = self.after(16, self._step)
+            self._draw()
+
         def _draw(self):
             b = self._box
             b.delete("all")
-            b.create_rectangle(0, 0, 22, 22, fill="#000000", outline="")
-            b.create_rectangle(2, 2, 20, 20, fill=C["input"], outline="")
-            b.create_rectangle(2, 2, 20, 4, fill=C["line"], outline="")
-            if self._var.get():
-                for cx, cy in self.CHECK:
-                    b.create_rectangle(1 + cx * 3, 1 + cy * 3 + 1, 4 + cx * 3, 4 + cy * 3 + 1,
-                                       fill=C["yellow"], outline="")
+            _rrect(b, 1, 2, 43, 22, 10, fill=_mix(C["bg2"], C["yellow"], _ease(self._x)), outline="")
+            kx = 12 + 20 * self._x
+            b.create_oval(kx - 8, 4, kx + 8, 20, fill=_mix(C["muted"], "#ffffff", self._x), outline="")
 
-    class PixelSlider(tk.Canvas):
-        """Ползунок с жёлтым «квадратным» бегунком."""
+    class SmoothSlider(tk.Canvas):
+        """Ползунок: градиентная дорожка, круглый бегунок, который «вырастает» при наведении."""
 
         def __init__(self, master, variable, lo, hi, step=256, width=380, bg=None):
             super().__init__(master, width=width, height=28, bg=bg or C["bg1"],
                              highlightthickness=0, bd=0, cursor="hand2")
             self._var, self._lo, self._hi, self._step = variable, lo, hi, step
             self._sw = width
+            self._g = 0.0
+            self._gt = 0.0
+            self._job = None
             self.bind("<Button-1>", self._click)
             self.bind("<B1-Motion>", self._click)
+            self.bind("<Enter>", lambda e: self._glow(1.0))
+            self.bind("<Leave>", lambda e: self._glow(0.0))
             self.bind("<Configure>", self._resized)
             variable.trace_add("write", lambda *a: self._draw())
+            self._draw()
+
+        def _glow(self, t):
+            self._gt = t
+            if self._job is None:
+                self._anim()
+
+        def _anim(self):
+            d = self._gt - self._g
+            if abs(d) < 0.04:
+                self._g, self._job = self._gt, None
+            else:
+                self._g += d * 0.3
+                self._job = self.after(16, self._anim)
             self._draw()
 
         def _resized(self, e):
@@ -1499,58 +1605,74 @@ if tk is not None:
                 self._draw()
 
         def _click(self, e):
-            tw = 16
-            frac = (e.x - tw / 2) / max(1, self._sw - tw)
-            frac = min(1.0, max(0.0, frac))
-            v = self._lo + frac * (self._hi - self._lo)
-            v = int(round(v / self._step) * self._step)
+            tw = 20
+            frac = min(1.0, max(0.0, (e.x - tw / 2) / max(1, self._sw - tw)))
+            v = int(round((self._lo + frac * (self._hi - self._lo)) / self._step) * self._step)
             self._var.set(max(self._lo, min(self._hi, v)))
 
         def _draw(self):
-            w, tw = self._sw, 16
+            w, tw = self._sw, 20
             try:
                 v = int(self._var.get())
             except Exception:
                 v = self._lo
             v = max(self._lo, min(self._hi, v))
             frac = (v - self._lo) / (self._hi - self._lo) if self._hi > self._lo else 0
-            x = frac * (w - tw)
+            x = frac * (w - tw) + tw / 2
             self.delete("all")
-            self.create_rectangle(0, 9, w, 19, fill="#000000", outline="")
-            self.create_rectangle(2, 11, w - 2, 17, fill=C["input"], outline="")
-            self.create_rectangle(2, 11, max(3, x + tw / 2), 17, fill=C["orange"], outline="")
-            self.create_rectangle(x, 1, x + tw, 27, fill="#000000", outline="")
-            self.create_rectangle(x + 2, 3, x + tw - 2, 25, fill=C["yellow"], outline="")
-            self.create_rectangle(x + 2, 3, x + tw - 2, 6, fill=C["yellow_hi"], outline="")
-            self.create_rectangle(x + 2, 22, x + tw - 2, 25, fill=C["yellow_lo"], outline="")
+            _rrect(self, 2, 11, w - 2, 17, 3, fill=C["bg2"], outline="")
+            if x > 6:
+                _rrect(self, 2, 11, x, 17, 3, fill=_mix(C["yellow_lo"], C["yellow_hi"], frac), outline="")
+            r = 8 + 2 * self._g
+            if self._g > 0.05:
+                self.create_oval(x - r - 4, 14 - r - 4, x + r + 4, 14 + r + 4,
+                                 fill=_mix(C["bg1"], C["yellow"], 0.25 * self._g), outline="")
+            self.create_oval(x - r, 14 - r, x + r, 14 + r, fill=C["yellow"], outline="")
 
-    class PixelProgress(tk.Canvas):
-        """Полоса прогресса из жёлто-оранжевых блоков."""
+    class SmoothProgress(tk.Canvas):
+        """Полоса прогресса: плавно догоняет значение, по ней бежит блик."""
 
         def __init__(self, master, bg=None):
-            super().__init__(master, height=20, bg=bg or C["bg0"], highlightthickness=0, bd=0)
+            super().__init__(master, height=14, bg=bg or C["bg0"], highlightthickness=0, bd=0)
             self._val, self._max = 0, 1
+            self._shown = 0.0
+            self._sh = 0.0
             self.bind("<Configure>", lambda e: self._draw())
+            self.after(40, self._tick)
 
         def set(self, val, mx):
             self._val, self._max = val, max(mx, 1)
-            self._draw()
+
+        def _tick(self):
+            try:
+                tgt = min(1.0, self._val / self._max)
+                if tgt < self._shown - 0.3:
+                    self._shown = tgt
+                else:
+                    self._shown += (tgt - self._shown) * 0.2
+                self._sh = (self._sh + 0.025) % 1.4
+                if self.winfo_viewable():
+                    self._draw()
+            finally:
+                self.after(33, self._tick)
 
         def _draw(self):
-            w, h = self.winfo_width(), 20
+            w, h = self.winfo_width(), 14
             if w < 12:
                 return
             self.delete("all")
-            self.create_rectangle(0, 0, w, h, fill="#000000", outline="")
-            self.create_rectangle(2, 2, w - 2, h - 2, fill=C["input"], outline="")
-            fw = int((w - 8) * min(1.0, self._val / self._max))
-            x, i = 4, 0
-            while x < 4 + fw:
-                x2 = min(x + 10, 4 + fw)
-                self.create_rectangle(x, 4, x2, h - 4,
-                                      fill=C["yellow"] if i % 2 == 0 else C["orange"], outline="")
-                x += 12
-                i += 1
+            _rrect(self, 0, 3, w, h - 3, 4, fill=C["bg2"], outline="")
+            fw = int(w * self._shown)
+            if fw > 8:
+                _rrect(self, 0, 3, fw, h - 3, 4, fill=C["yellow"], outline="")
+                _rrect(self, 0, 3, fw, 6, 2, fill=C["yellow_hi"], outline="")
+                bx = (self._sh - 0.2) * fw
+                x0, x1 = max(2, bx), min(fw - 2, bx + 70)
+                if x1 > x0 and self._shown < 0.995:
+                    _rrect(self, x0, 4, x1, h - 4, 3, fill=C["yellow_hi"], outline="")
+
+    # старые имена оставлены для совместимости
+    PixelButton, PixelCheck, PixelSlider, PixelProgress = AnimButton, ToggleSwitch, SmoothSlider, SmoothProgress
 
 
     class ScrollFrame(tk.Frame):
@@ -1575,21 +1697,32 @@ if tk is not None:
             self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
     class Dialog(tk.Toplevel):
-        """Небольшое окно в стиле лаунчера. Содержимое кладём в .body"""
+        """Диалог с плавным появлением. Содержимое кладём в .body"""
 
         def __init__(self, master, title, width=460):
-            super().__init__(master, bg="#000000")
+            super().__init__(master, bg=C["line"])
             self.title(title)
             self.transient(master)
             self.resizable(False, False)
             self.minsize(width, 120)
             inner = tk.Frame(self, bg=C["bg1"])
-            inner.pack(fill="both", expand=True, padx=3, pady=3)
+            inner.pack(fill="both", expand=True, padx=1, pady=1)
             self.body = tk.Frame(inner, bg=C["bg1"])
-            self.body.pack(fill="both", expand=True, padx=22, pady=18)
+            self.body.pack(fill="both", expand=True, padx=24, pady=20)
             try:
                 self.geometry(f"+{master.winfo_rootx() + 90}+{master.winfo_rooty() + 90}")
                 self.focus_force()
+                self.attributes("-alpha", 0.0)
+                self._fade(0.0)
+            except Exception:
+                pass
+
+        def _fade(self, a):
+            try:
+                a = min(1.0, a + 0.12)
+                self.attributes("-alpha", a)
+                if a < 1.0:
+                    self.after(16, lambda: self._fade(a))
             except Exception:
                 pass
 
@@ -1631,8 +1764,8 @@ TIPS = [
 class App:
     HEADER = 104
     MARGIN = 18
-    NAV = (("home", "ИГРАТЬ"), ("builds", "СБОРКИ"), ("mods", "МОДЫ"),
-           ("accounts", "АККАУНТЫ"), ("settings", "НАСТРОЙКИ"), ("log", "ЛОГ ИГРЫ"))
+    NAV = (("home", "Играть"), ("builds", "Сборки"), ("mods", "Моды"),
+           ("accounts", "Аккаунты"), ("settings", "Настройки"), ("log", "Лог игры"))
     SPEEDS = {"Медленно": 0.002, "Нормально": 0.0035, "Быстро": 0.007}
 
     def __init__(self, root):
@@ -1715,7 +1848,9 @@ class App:
                selectbackground=[("readonly", C["input"])],
                selectforeground=[("readonly", C["text"])],
                background=[("active", C["bg2"])])
-        st.configure("U.Vertical.TScrollbar", background=C["bg2"], troughcolor=C["bg0"],
+        st.map("U.Vertical.TScrollbar", background=[("active", C["line"]), ("!active", C["bg2"])])
+        st.configure("U.Vertical.TScrollbar", background=C["bg2"], troughcolor=C["bg0"], borderwidth=0,
+                     relief="flat", arrowsize=14, gripcount=0,
                      bordercolor=C["line"], arrowcolor=C["yellow"], lightcolor=C["line"],
                      darkcolor=C["line"])
         o = self.root.option_add
@@ -1807,11 +1942,11 @@ class App:
         if self.logo_img:
             self.bg.create_image(28, 12, image=self.logo_img, anchor="nw", tags="logo")
         else:
-            self.bg.create_text(28, 40, text="UEBAN", anchor="w", fill="#ffffff",
+            self.bg.create_text(28, 40, text="UEBAN", anchor="w", fill=C["text"],
                                 font=font(30, True), tags="logo")
-        sub = "MINECRAFT  JAVA  EDITION  LAUNCHER  " + APP_VERSION
-        self.bg.create_text(0, 0, text=sub, anchor="ne", fill="#3b1a00", font=font(11, True), tags="sub_sh")
-        self.bg.create_text(0, 0, text=sub, anchor="ne", fill="#ffffff", font=font(11, True), tags="sub")
+        sub = "Minecraft Java Edition · v" + APP_VERSION
+        self.bg.create_text(0, 0, text="", anchor="ne", fill=C["bg0"], font=font(11, True), tags="sub_sh")
+        self.bg.create_text(0, 0, text=sub, anchor="ne", fill=C["muted"], font=font(11), tags="sub")
 
     def _layout(self, e):
         W, H = e.width, e.height
@@ -1822,11 +1957,11 @@ class App:
         self.bg.coords("sub_sh", W - m + 2, 36)
 
     def _build_panel(self):
-        self.panel = tk.Frame(self.bg, bg="#000000")
+        self.panel = tk.Frame(self.bg, bg=C["line"])
         self._panel_id = self.bg.create_window(self.MARGIN, self.HEADER, window=self.panel,
                                                anchor="nw", width=900, height=500)
         inner = tk.Frame(self.panel, bg=C["bg0"])
-        inner.pack(fill="both", expand=True, padx=4, pady=4)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
         inner.columnconfigure(1, weight=1)
         inner.rowconfigure(0, weight=1)
         self._build_sidebar(inner)
@@ -1860,20 +1995,34 @@ class App:
                     bg=C["bg0"]).pack(side="bottom", pady=(0, 8))
 
     def _nav_hover(self, key, on):
-        if key == self.page:
-            return
-        row, bar, lab = self.nav[key]
-        col = C["hover"] if on else C["bg0"]
-        for w in (row, bar, lab):
-            w.configure(bg=col)
+        self._nav_to(key, 1.0 if (on or key == self.page) else 0.0)
 
     def _style_nav(self):
-        for key, (row, bar, lab) in self.nav.items():
-            sel = key == self.page
-            bgc = C["bg2"] if sel else C["bg0"]
-            row.configure(bg=bgc)
-            lab.configure(bg=bgc, fg=C["text"] if sel else C["muted"])
-            bar.configure(bg=C["yellow"] if sel else bgc)
+        for key in self.nav:
+            self._nav_to(key, 1.0 if key == self.page else 0.0)
+
+    def _nav_to(self, key, tgt):
+        if not hasattr(self, "_nav_lv"):
+            self._nav_lv, self._nav_t, self._nav_job = {}, {}, {}
+        self._nav_t[key] = tgt
+        if self._nav_job.get(key) is None:
+            self._nav_step(key)
+
+    def _nav_step(self, key):
+        row, bar, lab = self.nav[key]
+        lv, tgt = self._nav_lv.get(key, 0.0), self._nav_t.get(key, 0.0)
+        d = tgt - lv
+        if abs(d) < 0.03:
+            lv, self._nav_job[key] = tgt, None
+        else:
+            lv += d * 0.3
+            self._nav_job[key] = self.root.after(16, lambda: self._nav_step(key))
+        self._nav_lv[key] = lv
+        sel = key == self.page
+        bgc = _mix(C["bg0"], C["bg2"] if sel else C["hover"], min(1.0, lv))
+        row.configure(bg=bgc)
+        lab.configure(bg=bgc, fg=_mix(C["muted"], C["text"], min(1.0, lv)))
+        bar.configure(bg=_mix(bgc, C["yellow"], 1.0 if sel else 0.0), width=max(1, int(4 * lv)) if sel else 4)
 
     def show_page(self, key):
         self.page = key
@@ -1890,8 +2039,8 @@ class App:
     # ───── помощники ─────
     def _section(self, parent, title):
         f = tk.Frame(parent, bg=C["bg1"])
-        tk.Label(f, text=title.upper(), bg=C["bg1"], fg=C["yellow"], font=font(11, True)).pack(anchor="w")
-        tk.Frame(f, bg=C["line"], height=2).pack(fill="x", pady=(3, 8))
+        tk.Label(f, text=title, bg=C["bg1"], fg=C["yellow"], font=font(12, True)).pack(anchor="w")
+        tk.Frame(f, bg=C["line"], height=1).pack(fill="x", pady=(4, 10))
         return f
 
     def _label(self, parent, text, muted=False, wrap=0, bg=None):
@@ -1900,7 +2049,7 @@ class App:
 
     def _entry(self, parent, var, width=22, show=None):
         e = tk.Entry(parent, textvariable=var, width=width, bg=C["input"], fg=C["text"],
-                     insertbackground=C["yellow"], relief="flat", highlightthickness=2,
+                     insertbackground=C["yellow"], relief="flat", highlightthickness=1,
                      highlightbackground=C["line"], highlightcolor=C["yellow"], font=font(11),
                      disabledbackground=C["input"])
         if show:
@@ -1943,9 +2092,9 @@ class App:
         pad = tk.Frame(page, bg=C["bg1"])
         pad.pack(fill="both", expand=True, padx=30, pady=22)
         self._title(pad, "ГОТОВ К ИГРЕ").pack(anchor="w")
-        self._label(pad, "Выберите версию или сборку и аккаунт внизу, затем нажмите «ИГРАТЬ».",
+        self._label(pad, "Выберите версию или сборку и аккаунт внизу, затем нажмите «Играть».",
                     muted=True).pack(anchor="w", pady=(2, 16))
-        card = tk.Frame(pad, bg=C["bg0"], highlightbackground="#000000", highlightthickness=3)
+        card = tk.Frame(pad, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
         card.pack(fill="x")
         grid = tk.Frame(card, bg=C["bg0"])
         grid.pack(fill="x", padx=18, pady=12)
@@ -1962,7 +2111,7 @@ class App:
         sec = self._section(pad, "Советы")
         sec.pack(fill="x", pady=(20, 0))
         for t in TIPS:
-            tk.Label(sec, text="■  " + t, bg=C["bg1"], fg=C["text"], font=font(10), anchor="w",
+            tk.Label(sec, text="•  " + t, bg=C["bg1"], fg=C["text"], font=font(10), anchor="w",
                      justify="left", wraplength=640).pack(anchor="w", pady=2)
 
     def update_summary(self):
@@ -1988,7 +2137,7 @@ class App:
         self._title(pad, "СБОРКИ").grid(row=0, column=0, columnspan=2, sticky="w")
         left = tk.Frame(pad, bg=C["bg1"])
         left.grid(row=1, column=0, sticky="ns", padx=(0, 20), pady=(12, 0))
-        box = tk.Frame(left, bg="#000000")
+        box = tk.Frame(left, bg=C["line"])
         box.pack(fill="both", expand=True)
         self.b_list = self._listbox(box, 30, 12)
         self.b_list.pack(fill="both", expand=True, padx=2, pady=2)
@@ -2034,7 +2183,7 @@ class App:
     def show_build_info(self):
         inst = self.selected_build()
         if not inst:
-            self.b_info.configure(text="Сборок пока нет.\nНажмите «СОЗДАТЬ», чтобы сделать первую.")
+            self.b_info.configure(text="Сборок пока нет.\nНажмите «Создать», чтобы сделать первую.")
             return
         gd = instance_game_dir(inst)
         mods = len(list((gd / "mods").glob("*.jar"))) if (gd / "mods").exists() else 0
@@ -2169,7 +2318,7 @@ class App:
         self.more_btn = PixelButton(bot, "ЕЩЁ", lambda: self.mods_search(more=True), width=100, height=32, fs=10)
         self.more_btn.pack(side="left")
         self.more_btn.set_enabled(False)
-        self.mods_status_lbl = tk.Label(bot, text="Введите запрос и нажмите «ИСКАТЬ».", bg=C["bg1"],
+        self.mods_status_lbl = tk.Label(bot, text="Введите запрос и нажмите «Искать».", bg=C["bg1"],
                                         fg=C["muted"], font=font(9), anchor="w")
         self.mods_status_lbl.pack(side="left", padx=10)
         self.res_scroll.pack(fill="both", expand=True)
@@ -2226,8 +2375,10 @@ class App:
         q = dict(self._sq)
         key = self.v_cf_key.get().strip()
         if q["src"] == "curseforge" and not key:
-            self.mods_status("Для CurseForge нужен API-ключ: Настройки → Интеграции")
-            return
+            # ключ CurseForge необязателен: без него просто ищем на Modrinth
+            q["src"] = "modrinth"
+            self._sq["src"] = "modrinth"
+            self.v_src.set("Modrinth")
         self._busy_search = True
         self.mods_status("Ищу...")
 
@@ -2259,7 +2410,7 @@ class App:
                          else "Ничего не найдено — попробуйте другой запрос или снимите фильтр версии")
 
     def _result_row(self, body, it):
-        row = tk.Frame(body, bg=C["bg0"], highlightbackground="#000000", highlightthickness=2)
+        row = tk.Frame(body, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
         row.pack(fill="x", pady=4, padx=(0, 6))
         row.columnconfigure(0, weight=1)
         info = tk.Frame(row, bg=C["bg0"])
@@ -2324,7 +2475,7 @@ class App:
             return
         for f in files:
             off = f.name.endswith(".disabled")
-            row = tk.Frame(body, bg=C["bg0"], highlightbackground="#000000", highlightthickness=2)
+            row = tk.Frame(body, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
             row.pack(fill="x", pady=3, padx=(0, 6))
             tk.Label(row, text=("[выкл]  " if off else "") + f.name.replace(".disabled", ""), bg=C["bg0"],
                      fg=C["muted"] if off else C["text"], font=font(10), anchor="w").pack(
@@ -2361,7 +2512,7 @@ class App:
         self._title(pad, "АККАУНТЫ").grid(row=0, column=0, columnspan=2, sticky="w")
         left = tk.Frame(pad, bg=C["bg1"])
         left.grid(row=1, column=0, sticky="ns", padx=(0, 20), pady=(12, 0))
-        box = tk.Frame(left, bg="#000000")
+        box = tk.Frame(left, bg=C["line"])
         box.pack(fill="both", expand=True)
         self.acc_list = self._listbox(box, 32, 10)
         self.acc_list.pack(fill="both", expand=True, padx=2, pady=2)
@@ -2516,7 +2667,7 @@ class App:
         btn.pack(anchor="e", pady=(8, 0))
 
     def add_ms_dialog(self):
-        cid = self.v_ms_cid.get().strip()
+        cid = self.v_ms_cid.get().strip() or DEFAULT_MS_CLIENT_ID
         if not cid:
             self._ms_setup_dialog()
             return
@@ -2697,11 +2848,11 @@ class App:
         # --- интеграции
         s = self._section(right, "Интеграции")
         s.pack(fill="x", pady=(0, 14))
-        self._label(s, "Microsoft Client ID (для входа через Microsoft)").pack(anchor="w")
+        self._label(s, "Microsoft Client ID (необязательно)").pack(anchor="w")
         self._entry(s, self.v_ms_cid, 30).pack(fill="x", pady=(4, 8))
-        self._label(s, "API-ключ CurseForge (для поиска модов на CurseForge)").pack(anchor="w")
+        self._label(s, "API-ключ CurseForge (необязательно)").pack(anchor="w")
         self._entry(s, self.v_cf_key, 30, show="•").pack(fill="x", pady=(4, 0))
-        self._label(s, "Ключ выдаёт console.curseforge.com. Modrinth работает без ключа.", muted=True,
+        self._label(s, "Без ключа моды ищутся на Modrinth, там есть почти все популярные. Ключ выдаёт console.curseforge.com.", muted=True,
                     wrap=380).pack(anchor="w", pady=(6, 0))
 
         # --- лаунчер
@@ -2805,7 +2956,7 @@ class App:
     def _build_log(self, page):
         pad = tk.Frame(page, bg=C["bg1"])
         pad.pack(fill="both", expand=True, padx=22, pady=18)
-        box = tk.Frame(pad, bg="#000000")
+        box = tk.Frame(pad, bg=C["line"])
         box.pack(fill="both", expand=True)
         self.text = tk.Text(box, wrap="word", state="disabled", bg=C["input"], fg=C["text"],
                             insertbackground=C["yellow"], relief="flat", bd=0, font=("Consolas", -14),
@@ -2823,13 +2974,13 @@ class App:
     def _build_bottom(self, parent):
         bottom = tk.Frame(parent, bg=C["bg0"])
         bottom.grid(row=1, column=0, columnspan=2, sticky="ew")
-        tk.Frame(bottom, bg="#000000", height=3).pack(fill="x")
+        tk.Frame(bottom, bg=C["line"], height=1).pack(fill="x")
         strip = tk.Frame(bottom, bg=C["bg0"])
         strip.pack(fill="x", padx=16, pady=(8, 0))
         self.status = tk.Label(strip, text="Загрузка списка версий...", bg=C["bg0"], fg=C["muted"],
                                font=font(9), anchor="w")
         self.status.pack(fill="x")
-        self.pbar = PixelProgress(strip, bg=C["bg0"])
+        self.pbar = SmoothProgress(strip, bg=C["bg0"])
         self.pbar.pack(fill="x", pady=(3, 0))
 
         ctrl = tk.Frame(bottom, bg=C["bg0"])
@@ -2845,7 +2996,7 @@ class App:
                                   style="U.TCombobox", font=font(10))
         self.combo.pack(pady=(3, 0))
 
-        self.play = PixelButton(ctrl, "ИГРАТЬ", self.on_play, width=280, height=58, fs=17, bg=C["bg0"])
+        self.play = PixelButton(ctrl, "ИГРАТЬ", self.on_play, width=280, height=58, fs=17, bg=C["bg0"], kind="primary", pulse=True)
         self.play.grid(row=0, column=1)
 
         right = tk.Frame(ctrl, bg=C["bg0"])
