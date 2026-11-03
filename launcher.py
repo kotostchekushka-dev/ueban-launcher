@@ -38,7 +38,7 @@ except ImportError:  # для тестов без GUI
     tk = None
 
 APP_NAME = "Ueban Launcher"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 UA = f"UebanLauncher/{APP_VERSION}"
 # Microsoft Client ID приложения лаунчера. Если вписать его сюда (один раз, разработчиком),
 # пользователям не придётся ничего вводить: вход через Microsoft заработает сразу.
@@ -77,6 +77,68 @@ VERIFY = False  # проверять sha1 уже скачанных файлов
 
 CREATE_NO_WINDOW = 0x08000000
 HIGH_PRIORITY_CLASS = 0x00000080
+
+
+
+def resource_path(name):
+    """Путь к файлу рядом со скриптом или внутри собранного exe (PyInstaller)."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+ICON_FILE = BASE / "ueban.ico"
+
+
+def ensure_icon_file():
+    """Кладём ueban.ico в папку лаунчера: на него ссылаются ярлыки, значок везде один и тот же."""
+    try:
+        src_ico = resource_path("ueban.ico")
+        if os.path.exists(src_ico):
+            BASE.mkdir(parents=True, exist_ok=True)
+            if (not ICON_FILE.exists()) or ICON_FILE.stat().st_size != os.path.getsize(src_ico):
+                shutil.copyfile(src_ico, ICON_FILE)
+            return str(ICON_FILE)
+    except Exception:
+        pass
+    return None
+
+
+def set_app_id():
+    """Без этого Windows группирует окно под значком python и не показывает наш значок на панели задач."""
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Ueban.Launcher.Minecraft")
+        except Exception:
+            pass
+
+
+def create_desktop_shortcut():
+    """Ярлык на рабочем столе с тем же значком ueban.ico. → путь к ярлыку."""
+    if not IS_WIN:
+        raise RuntimeError("Ярлык на рабочем столе поддерживается только в Windows")
+    ico = ensure_icon_file()
+    if getattr(sys, "frozen", False):
+        target, args, workdir = sys.executable, "", str(Path(sys.executable).parent)
+    else:
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        target = str(pyw if pyw.exists() else sys.executable)
+        args = '"%s"' % os.path.abspath(__file__)
+        workdir = os.path.dirname(os.path.abspath(__file__))
+    icon = (ico or target) + ",0"
+
+    def q(s):
+        return "'" + str(s).replace("'", "''") + "'"
+    ps = ("$d=[Environment]::GetFolderPath('Desktop');"
+          "$l=Join-Path $d 'Ueban Launcher.lnk';"
+          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($l);"
+          f"$s.TargetPath={q(target)};$s.Arguments={q(args)};$s.WorkingDirectory={q(workdir)};"
+          f"$s.IconLocation={q(icon)};$s.Description='Ueban Launcher';$s.Save();Write-Output $l")
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "PowerShell error").strip())
+    return r.stdout.strip()
 
 
 # ───────────────────────── сеть / файлы ─────────────────────────
@@ -1048,21 +1110,12 @@ def resolve_auth(account, cfg, log):
 # ───────────────────────── библиотека модов ─────────────────────────
 
 MR_API = "https://api.modrinth.com/v2"
-CF_API = "https://api.curseforge.com/v1"
-# ключ: (название, тип проекта Modrinth, classId CurseForge, папка в игре)
+# ключ: (название, тип проекта Modrinth, зарезервировано, папка в игре)
 CONTENT_TYPES = {
     "mods": ("Моды", "mod", 6, "mods"),
     "resourcepacks": ("Ресурспаки", "resourcepack", 12, "resourcepacks"),
     "shaders": ("Шейдеры", "shader", 6552, "shaderpacks"),
 }
-CF_LOADER = {"forge": 1, "fabric": 4, "quilt": 5, "neoforge": 6}
-CF_SORT = {"relevance": 1, "downloads": 6, "updated": 3, "newest": 11}
-
-
-class ManualDownload(Exception):
-    def __init__(self, url, filename=""):
-        super().__init__(url)
-        self.url, self.filename = url, filename
 
 
 def modrinth_search(query, ctype, mc, loader, sort, offset=0, limit=20):
@@ -1119,75 +1172,6 @@ def modrinth_install(pid, ctype, mc, loader, dest, log, _seen=None, _depth=0):
                     done += modrinth_install(dpid, ctype, mc, loader, dest, log, seen, _depth + 1)
                 except Exception as e:
                     log(f"Зависимость {dpid}: {e}")
-    return done
-
-
-def cf_headers(key):
-    return {"x-api-key": key}
-
-
-def cf_search(key, query, ctype, mc, loader, sort, offset=0, limit=20):
-    p = {"gameId": 432, "classId": CONTENT_TYPES[ctype][2], "searchFilter": query,
-         "sortField": CF_SORT.get(sort, 2), "sortOrder": "desc", "pageSize": limit, "index": offset}
-    if mc:
-        p["gameVersion"] = mc
-    if loader and ctype == "mods" and loader in CF_LOADER:
-        p["modLoaderType"] = CF_LOADER[loader]
-    st, js = http_request(f"{CF_API}/mods/search?" + urllib.parse.urlencode(p), headers=cf_headers(key))
-    if st in (401, 403):
-        raise RuntimeError("CurseForge не принял API-ключ (проверьте его в настройках)")
-    if st != 200:
-        raise RuntimeError(f"CurseForge: HTTP {st}")
-    items = [dict(source="curseforge", id=m["id"], title=m.get("name", ""),
-                  author=((m.get("authors") or [{}])[0]).get("name", ""), desc=m.get("summary", ""),
-                  downloads=m.get("downloadCount", 0), url=(m.get("links") or {}).get("websiteUrl", ""))
-             for m in js.get("data", [])]
-    total = int((js.get("pagination") or {}).get("totalCount", len(items)))
-    return items, total
-
-
-def cf_install(key, mod_id, ctype, mc, loader, dest, log, site_url="", _seen=None, _depth=0):
-    seen = _seen if _seen is not None else set()
-    if mod_id in seen:
-        return []
-    seen.add(mod_id)
-    p = {"pageSize": 50}
-    if mc:
-        p["gameVersion"] = mc
-    if loader and ctype == "mods" and loader in CF_LOADER:
-        p["modLoaderType"] = CF_LOADER[loader]
-    st, js = http_request(f"{CF_API}/mods/{mod_id}/files?" + urllib.parse.urlencode(p),
-                          headers=cf_headers(key))
-    if st in (401, 403):
-        raise ManualDownload(site_url)
-    if st != 200:
-        raise RuntimeError(f"CurseForge: HTTP {st}")
-    files = js.get("data", [])
-    if not files:
-        raise RuntimeError("Нет подходящего файла для вашей версии Minecraft / загрузчика")
-    files.sort(key=lambda x: (x.get("releaseType", 1) == 1, x.get("fileDate", "")), reverse=True)
-    f = files[0]
-    url = f.get("downloadUrl")
-    if not url:
-        st, js2 = http_request(f"{CF_API}/mods/{mod_id}/files/{f['id']}/download-url",
-                               headers=cf_headers(key))
-        url = js2.get("data") if st == 200 else None
-    if not url:
-        raise ManualDownload(site_url, f.get("fileName", ""))
-    sha1 = next((h["value"] for h in f.get("hashes", []) if h.get("algo") == 1), None)
-    Path(dest).mkdir(parents=True, exist_ok=True)
-    fetch(url, Path(dest) / f["fileName"], sha1, f.get("fileLength"))
-    done = [f["fileName"]]
-    log(f"Скачано: {f['fileName']}")
-    if _depth < 3 and ctype == "mods":
-        for dep in f.get("dependencies", []):
-            if dep.get("relationType") == 3:
-                try:
-                    done += cf_install(key, dep["modId"], ctype, mc, loader, dest, log, "", seen, _depth + 1)
-                except ManualDownload:
-                    log(f"Зависимость {dep['modId']} нельзя скачать автоматически — скачайте вручную с CurseForge")
-                except Exception as e:
-                    log(f"Зависимость {dep['modId']}: {e}")
     return done
 
 
@@ -1298,14 +1282,15 @@ def prepare_and_launch(cfg, target, account, log, progress, manifest=None, on_st
 # ═════════════════════════════ ИНТЕРФЕЙС ═════════════════════════════
 
 C = {
-    "bg0": "#0a0c13",     # самый тёмный (панели, фон)
-    "bg1": "#10131c",     # основной фон страниц
-    "bg2": "#1a1f2e",     # выделение
-    "hover": "#151927",
-    "input": "#0b0d14",
-    "line": "#272d42",
-    "text": "#eef0f6",
-    "muted": "#8b93a9",
+    "bg0": "#0a0914",     # самый тёмный (боковая панель, нижняя панель)
+    "bg1": "#110f1f",     # основной фон страниц
+    "bg2": "#201d38",     # выделение
+    "hover": "#171428",
+    "card": "#171529",    # карточки
+    "input": "#0c0b17",
+    "line": "#2c2848",
+    "text": "#f4f2fc",
+    "muted": "#9d98b8",
     "yellow": "#ffb020",      # акцентный цвет
     "yellow_hi": "#ffd36b",
     "yellow_lo": "#e8890c",
@@ -1313,6 +1298,10 @@ C = {
     "brown": "#1a1205",       # текст на акцентной кнопке
     "red": "#ff7b7b",
     "green": "#6ee7a0",
+    "violet": "#9d7bff",
+    "violet_lo": "#3a2f78",
+    "pink": "#ff6fae",
+    "blue": "#55c6ff",
 }
 FONT = "Segoe UI" if IS_WIN else "Helvetica"
 
@@ -1353,6 +1342,16 @@ if tk is not None:
                x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
         return cv.create_polygon(pts, smooth=True, splinesteps=12, **kw)
 
+    def _grad_rrect(cv, x0, y0, x1, y1, r, c_top, c_bot):
+        """Скруглённый прямоугольник с вертикальным градиентом (построчно)."""
+        h = max(1, int(y1 - y0))
+        r = max(0, min(r, h / 2, (x1 - x0) / 2))
+        for i in range(h):
+            t = i / max(1, h - 1)
+            d = r - i if i < r else (i - (h - 1 - r) if i > h - 1 - r else 0)
+            inset = (r - math.sqrt(max(0.0, r * r - d * d))) if d > 0 else 0
+            cv.create_line(x0 + inset, y0 + i, x1 - inset, y0 + i, fill=_mix(c_top, c_bot, t))
+
     def _nice(text):
         """ВЕРХНИЙ РЕГИСТР → обычный (Первая буква заглавная, латинские слова с заглавной)."""
         if not text or not text.isupper():
@@ -1373,8 +1372,8 @@ if tk is not None:
 
     class AnimatedBG(tk.Canvas):
         """Фон: тёмный градиент и мягкие светящиеся шары, которые медленно плывут."""
-        ORBS = [("#ff8a1f", 0.30, 0.00, 0.9, 0.7, 0.8), ("#ffb020", 0.22, 1.9, 0.7, 1.1, 0.6),
-                ("#7a5cff", 0.26, 3.7, 1.1, 0.8, 0.5)]
+        ORBS = [("#ff8a1f", 0.30, 0.00, 0.9, 0.7, 0.8), ("#9d7bff", 0.30, 1.9, 0.7, 1.1, 0.6),
+                ("#ff4f9a", 0.22, 3.7, 1.1, 0.8, 0.5), ("#4aa8ff", 0.18, 5.1, 0.6, 0.9, 0.4)]
 
         def __init__(self, master):
             super().__init__(master, highlightthickness=0, bd=0, bg=C["bg0"])
@@ -1428,7 +1427,7 @@ if tk is not None:
                    "СОХРАНИТЬ И ВОЙТИ", "ВЫБРАТЬ ДЛЯ ИГРЫ", "ВКЛЮЧИТЬ")
 
         def __init__(self, master, text, command, width=170, height=40, fs=11, bg=None, kind=None, pulse=False):
-            super().__init__(master, width=width, height=height, bg=bg or C["bg1"],
+            super().__init__(master, width=width, height=height, bg=bg or master.cget("bg"),
                              highlightthickness=0, bd=0, cursor="hand2")
             self._label = text
             self._cmd = command
@@ -1500,24 +1499,29 @@ if tk is not None:
             bgc = self.cget("bg")
             self.delete("all")
             if self._primary:
-                base, top, fg = C["yellow"], C["yellow_hi"], C["brown"]
+                top, bot, fg = C["yellow_hi"], C["yellow_lo"], C["brown"]
                 if not self._enabled:
-                    base, fg = _mix(C["bg2"], C["muted"], 0.25), C["muted"]
-            else:
-                base, top, fg = C["bg2"], C["line"], C["text"]
-                if not self._enabled:
+                    top = bot = _mix(C["bg2"], C["muted"], 0.18)
                     fg = C["muted"]
-            col = _mix(base, top, 0.55 * self._h) if self._enabled else base
+            else:
+                top, bot, fg = _mix(C["bg2"], "#ffffff", 0.07), C["bg2"], C["text"]
+                if not self._enabled:
+                    top = bot = C["bg2"]
+                    fg = C["muted"]
+            if self._enabled:
+                top, bot = _mix(top, "#ffffff", 0.18 * self._h), _mix(bot, "#ffffff", 0.10 * self._h)
             inset = 1.5 if (self._down and self._enabled) else 0
             if self._primary and self._enabled and self._pulse and not self._hover:
                 g = (math.sin(self._ph) + 1) / 2
-                _rrect(self, 0, 0, w, h, 14, fill=_mix(bgc, C["yellow"], 0.10 + 0.22 * g), outline="")
+                _rrect(self, 0, 0, w, h, 18, fill=_mix(bgc, C["yellow"], 0.08 + 0.20 * g), outline="")
             elif self._primary and self._enabled and self._h > 0:
-                _rrect(self, 0, 0, w, h, 14, fill=_mix(bgc, C["yellow"], 0.28 * self._h), outline="")
-            _rrect(self, 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset, 11, fill=col, outline="")
+                _rrect(self, 0, 0, w, h, 18, fill=_mix(bgc, C["yellow"], 0.26 * self._h), outline="")
+            x0, y0, x1, y1 = 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset
+            r = min(12, (y1 - y0) / 2)
+            _grad_rrect(self, x0, y0, x1, y1, r, top, bot)
             if not self._primary:
-                _rrect(self, 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset, 11, fill="",
-                       outline=_mix(C["line"], C["yellow"], self._h) if self._enabled else C["line"])
+                _rrect(self, x0, y0, x1, y1, r, fill="",
+                       outline=_mix(C["line"], C["violet"], self._h) if self._enabled else C["line"])
             f = font(self._fs, True)
             self.create_text(w / 2, h / 2 + inset - 1, text=_nice(self._label), fill=fg, font=f)
 
@@ -1525,7 +1529,7 @@ if tk is not None:
         """Переключатель: бегунок плавно скользит, цвет перетекает."""
 
         def __init__(self, master, text, variable, command=None, bg=None):
-            bg = bg or C["bg1"]
+            bg = bg or master.cget("bg")
             super().__init__(master, bg=bg, cursor="hand2")
             self._var, self._cmd, self._bgc = variable, command, bg
             self._x = 1.0 if variable.get() else 0.0
@@ -1570,7 +1574,7 @@ if tk is not None:
         """Ползунок: градиентная дорожка, круглый бегунок, который «вырастает» при наведении."""
 
         def __init__(self, master, variable, lo, hi, step=256, width=380, bg=None):
-            super().__init__(master, width=width, height=28, bg=bg or C["bg1"],
+            super().__init__(master, width=width, height=28, bg=bg or master.cget("bg"),
                              highlightthickness=0, bd=0, cursor="hand2")
             self._var, self._lo, self._hi, self._step = variable, lo, hi, step
             self._sw = width
@@ -1671,6 +1675,98 @@ if tk is not None:
                 if x1 > x0 and self._shown < 0.995:
                     _rrect(self, x0, 4, x1, h - 4, 3, fill=C["yellow_hi"], outline="")
 
+    class Banner(tk.Canvas):
+        """Градиентная шапка страницы: закат от индиго к оранжевому, внутри плывут пиксели."""
+        ANIM = True
+        STOPS = ("#1c1342", "#3a1a64", "#8c2c4c", "#ff8a1f")
+
+        def __init__(self, master, title, sub="", height=76, big=False, bg=None):
+            self._pbg = bg or C["bg1"]
+            super().__init__(master, height=height, bg=self._pbg, highlightthickness=0, bd=0)
+            self._title, self._sub, self._big = title, sub, big
+            self._px = []
+            for k in range(16):
+                self._px.append([(k * 0.137 + 0.05) % 1.0, (k * 0.311) % 1.0, 3 + (k % 3) * 2,
+                                 0.0016 + 0.0011 * (k % 4), k % 5])
+            self._items = []
+            self._cw = 0
+            self.bind("<Configure>", lambda e: self._redraw())
+            self.after(80, self._tick)
+
+        def set_text(self, title=None, sub=None):
+            if title is not None:
+                self._title = title
+            if sub is not None:
+                self._sub = sub
+            self._redraw()
+
+        def _grad(self, t):
+            s = self.STOPS
+            t = min(1.0, max(0.0, t)) ** 1.7
+            x = t * (len(s) - 1)
+            i = min(int(x), len(s) - 2)
+            return _mix(s[i], s[i + 1], x - i)
+
+        def _redraw(self):
+            w, h = self.winfo_width(), int(self.cget("height"))
+            if w < 40:
+                return
+            self._cw = w
+            self.delete("all")
+            step = 8
+            n = w // step + 1
+            for i in range(n):
+                self.create_rectangle(i * step, 0, i * step + step + 1, h, fill=self._grad(i / max(1, n - 1)),
+                                      outline="")
+            gx, gy = w - h * 0.55, h * 0.5
+            for k in range(14):          # мягкое свечение справа (без stipple — плавные кольца)
+                rr = h * (1.25 - k * 0.075)
+                edge = min(1.0, max(0.0, (gx - rr) / max(1, w)))
+                self.create_oval(gx - rr, gy - rr, gx + rr, gy + rr, outline="",
+                                 fill=_mix(self._grad(edge), "#ffc15a", 0.03 + 0.5 * (k / 13) ** 2))
+            self._items = []
+            for px, py, sz, sp, ph in self._px:
+                col = _mix(self._grad(px), "#ffffff", 0.35)
+                self._items.append(self.create_rectangle(0, 0, 1, 1, fill=col, outline="", tags="px"))
+            self._move()
+            r = 14
+            for sx, sy in ((0, 0), (1, 0), (0, 1), (1, 1)):     # скругление углов
+                pts = [(0, 0), (r, 0)]
+                for k in range(9):
+                    a = math.radians(270 - 90 * k / 8)
+                    pts.append((r + r * math.cos(a), r + r * math.sin(a)))
+                pts.append((0, r))
+                flat = []
+                for x, y in pts:
+                    flat += [(w - x) if sx else x, (h - y) if sy else y]
+                self.create_polygon(flat, fill=self._pbg, outline="")
+            ty = h / 2 - (10 if self._sub else 0)
+            if self._big:
+                ty = h / 2 - 18
+            f1 = font(26 if self._big else 19, True)
+            self.create_text(26, ty + 2, text=self._title, anchor="w", fill="#0a0612", font=f1)
+            self.create_text(24, ty, text=self._title, anchor="w", fill="#ffffff", font=f1)
+            if self._sub:
+                self.create_text(25, ty + (36 if self._big else 28), text=self._sub, anchor="w",
+                                 fill="#d8cffa", font=font(12 if self._big else 10))
+
+        def _move(self):
+            w, h = self._cw, int(self.cget("height"))
+            for it, (px, py, sz, sp, ph) in zip(self._items, self._px):
+                x, y = px * w, py * h
+                self.coords(it, x, y, x + sz, y + sz)
+
+        def _tick(self):
+            try:
+                if self.ANIM and self._items and self.winfo_viewable():
+                    for p in self._px:
+                        p[1] -= p[3]
+                        if p[1] < -0.1:
+                            p[1] = 1.05
+                    self._move()
+            finally:
+                self.after(60, self._tick)
+
     # старые имена оставлены для совместимости
     PixelButton, PixelCheck, PixelSlider, PixelProgress = AnimButton, ToggleSwitch, SmoothSlider, SmoothProgress
 
@@ -1728,8 +1824,8 @@ if tk is not None:
 
 
 # ─────────────── картинки (вшиты в файл, отдельные файлы не нужны) ───────────────
-LOGO_B64 = "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"
-ICON_B64 = "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"
+LOGO_B64 = "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"
+ICON_B64 = "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"
 
 
 def load_cfg():
@@ -1758,12 +1854,14 @@ TIPS = [
     "Профиль «Оптимальный» (G1GC) обычно уменьшает фризы из-за сборщика мусора.",
     "Сборки (вкладка «Сборки») хранят моды, миры и настройки отдельно друг от друга.",
     "Если игра не запускается, загляните в «Лог игры»: причина обычно видна в последних строках.",
+    "Клик по карточке профиля слева внизу открывает вкладку «Аккаунты».",
+    "В «Настройках» есть кнопка «Ярлык на рабочий стол» — значок у ярлыка тот же, что у лаунчера.",
 ]
 
 
 class App:
-    HEADER = 104
-    MARGIN = 18
+    HEADER = 16
+    MARGIN = 16
     NAV = (("home", "Играть"), ("builds", "Сборки"), ("mods", "Моды"),
            ("accounts", "Аккаунты"), ("settings", "Настройки"), ("log", "Лог игры"))
     SPEEDS = {"Медленно": 0.002, "Нормально": 0.0035, "Быстро": 0.007}
@@ -1787,8 +1885,8 @@ class App:
         self._ensure_accounts()
 
         root.title(APP_NAME)
-        root.geometry("1120x760")
-        root.minsize(980, 690)
+        root.geometry("1200x800")
+        root.minsize(1020, 720)
         root.configure(bg=C["bg0"])
         self._load_images()
         self._init_style()
@@ -1802,6 +1900,10 @@ class App:
 
         self.bg.enabled = self.v_anim.get()
         self.bg.step = self.SPEEDS.get(self.v_speed.get(), 0.0035)
+        Banner.ANIM = self.v_anim.get()
+        self.v_anim.trace_add("write", lambda *a: self._anim_changed())
+        self.v_speed.trace_add("write", lambda *a: self._anim_changed())
+        self.root.after(12000, self._rotate_tip)
         self.refresh_targets()
         self.refresh_accounts()
         self.refresh_builds_list()
@@ -1825,14 +1927,46 @@ class App:
             self.cfg["active_account"] = accs[0]["id"]
 
     def _load_images(self):
-        self.logo_img = None
+        """Значок окна/панели задач берём из ueban.ico — тот же файл, что и у exe и ярлыка."""
+        self.logo_img = self.icon_img = None
         try:
             self.logo_img = tk.PhotoImage(data=LOGO_B64)
-            self.icon_img = tk.PhotoImage(data=ICON_B64)
-            self.root.iconphoto(True, self.icon_img)
         except Exception:
             pass
+        ico = ensure_icon_file() or resource_path("ueban.ico")
+        done = False
+        if IS_WIN and ico and os.path.exists(ico):
+            try:
+                self.root.iconbitmap(default=ico)
+                self.root.iconbitmap(ico)
+                done = True
+            except Exception:
+                pass
+        if not done:
+            try:
+                self.icon_img = tk.PhotoImage(data=ICON_B64)
+                self.root.iconphoto(True, self.icon_img)
+            except Exception:
+                pass
 
+    def _anim_changed(self):
+        on = bool(self.v_anim.get())
+        self.bg.enabled = on
+        Banner.ANIM = on
+        self.bg.step = self.SPEEDS.get(self.v_speed.get(), 0.0035)
+
+    def _rotate_tip(self):
+        try:
+            if self.page == "home":
+                self._next_tip()
+        finally:
+            self.root.after(12000, self._rotate_tip)
+
+    def _next_tip(self):
+        self._tip_i = (getattr(self, "_tip_i", 0) + 1) % len(TIPS)
+        if hasattr(self, "tip_lbl"):
+            self.tip_lbl.configure(text=TIPS[self._tip_i])
+            self.tip_no.configure(text=f"{self._tip_i + 1} / {len(TIPS)}")
     def _init_style(self):
         st = ttk.Style()
         try:
@@ -1841,7 +1975,7 @@ class App:
             pass
         st.configure("U.TCombobox", fieldbackground=C["input"], background=C["bg2"],
                      foreground=C["text"], arrowcolor=C["yellow"], bordercolor=C["line"],
-                     lightcolor=C["line"], darkcolor=C["line"], padding=4)
+                     lightcolor=C["line"], darkcolor=C["line"], padding=7)
         st.map("U.TCombobox",
                fieldbackground=[("readonly", C["input"])],
                foreground=[("readonly", C["text"])],
@@ -1897,7 +2031,6 @@ class App:
         self.v_verify = tk.BooleanVar(value=bool(c.get("verify_files", False)))
         self.v_showcmd = tk.BooleanVar(value=bool(c.get("show_cmd", False)))
         self.v_ms_cid = tk.StringVar(value=c.get("ms_client_id", ""))
-        self.v_cf_key = tk.StringVar(value=c.get("cf_api_key", ""))
         for v in (self.v_ram, self.v_xms, self.v_preset, self.v_java):
             v.trace_add("write", lambda *a: self.update_summary())
         self.v_launch.trace_add("write", lambda *a: self._on_launch_change())
@@ -1924,8 +2057,7 @@ class App:
             animate=self.v_anim.get(), speed=self.v_speed.get(),
             snapshots=self.v_snap.get(), old_versions=self.v_old.get(),
             per_version_dirs=self.v_perver.get(), verify_files=self.v_verify.get(),
-            show_cmd=self.v_showcmd.get(), ms_client_id=self.v_ms_cid.get().strip(),
-            cf_api_key=self.v_cf_key.get().strip())
+            show_cmd=self.v_showcmd.get(), ms_client_id=self.v_ms_cid.get().strip())
 
     def save_all(self):
         if self._skip_save:
@@ -1939,22 +2071,13 @@ class App:
 
     # ───── вёрстка ─────
     def _build_header(self):
-        if self.logo_img:
-            self.bg.create_image(28, 12, image=self.logo_img, anchor="nw", tags="logo")
-        else:
-            self.bg.create_text(28, 40, text="UEBAN", anchor="w", fill=C["text"],
-                                font=font(30, True), tags="logo")
-        sub = "Minecraft Java Edition · v" + APP_VERSION
-        self.bg.create_text(0, 0, text="", anchor="ne", fill=C["bg0"], font=font(11, True), tags="sub_sh")
-        self.bg.create_text(0, 0, text=sub, anchor="ne", fill=C["muted"], font=font(11), tags="sub")
+        pass
 
     def _layout(self, e):
         W, H = e.width, e.height
         m, top = self.MARGIN, self.HEADER
         self.bg.coords(self._panel_id, m, top)
         self.bg.itemconfigure(self._panel_id, width=max(300, W - 2 * m), height=max(300, H - top - m))
-        self.bg.coords("sub", W - m, 34)
-        self.bg.coords("sub_sh", W - m + 2, 36)
 
     def _build_panel(self):
         self.panel = tk.Frame(self.bg, bg=C["line"])
@@ -1970,29 +2093,71 @@ class App:
 
     # ───── сайдбар ─────
     def _build_sidebar(self, parent):
-        sb = tk.Frame(parent, bg=C["bg0"], width=210)
+        sb = tk.Frame(parent, bg=C["bg0"], width=250)
         sb.grid(row=0, column=0, sticky="ns")
         sb.pack_propagate(False)
-        tk.Label(sb, text="МЕНЮ", bg=C["bg0"], fg=C["muted"], font=font(9, True)).pack(
-            anchor="w", padx=18, pady=(12, 6))
+        top = tk.Frame(sb, bg=C["bg0"])
+        top.pack(fill="x", pady=(24, 0))
+        if self.logo_img:
+            tk.Label(top, image=self.logo_img, bg=C["bg0"]).pack()
+        else:
+            tk.Label(top, text="UEBAN", bg=C["bg0"], fg=C["yellow"], font=font(26, True)).pack()
+        tk.Label(top, text="Minecraft Java Edition  ·  v" + APP_VERSION, bg=C["bg0"], fg=C["muted"],
+                 font=font(9)).pack(pady=(8, 0))
+        tk.Frame(sb, bg=C["line"], height=1).pack(fill="x", padx=20, pady=(18, 12))
+        sym = "Segoe UI Symbol" if IS_WIN else "DejaVu Sans"
+        icons = {"home": "\u25B6", "builds": "\u2756", "mods": "\u271A", "accounts": "\u263B",
+                 "settings": "\u2699", "log": "\u2630"}
         self.nav = {}
         for key, text in self.NAV:
             row = tk.Frame(sb, bg=C["bg0"], cursor="hand2")
-            row.pack(fill="x")
-            bar = tk.Frame(row, bg=C["bg0"], width=5)
+            row.pack(fill="x", padx=10, pady=1)
+            bar = tk.Frame(row, bg=C["bg0"], width=4)
             bar.pack(side="left", fill="y")
+            ico = tk.Label(row, text=icons.get(key, "\u2022"), bg=C["bg0"], fg=C["muted"], font=(sym, -17),
+                           width=2, cursor="hand2")
+            ico.pack(side="left", padx=(10, 0))
             lab = tk.Label(row, text=text, bg=C["bg0"], fg=C["muted"], font=font(12, True),
-                           anchor="w", padx=14, pady=9, cursor="hand2")
+                           anchor="w", padx=6, pady=10, cursor="hand2")
             lab.pack(side="left", fill="x", expand=True)
-            for w in (row, bar, lab):
+            for w in (row, bar, ico, lab):
                 w.bind("<Button-1>", lambda e, k=key: self.show_page(k))
                 w.bind("<Enter>", lambda e, k=key: self._nav_hover(k, True))
                 w.bind("<Leave>", lambda e, k=key: self._nav_hover(k, False))
-            self.nav[key] = (row, bar, lab)
-        PixelButton(sb, "ПАПКА ВЕРСИИ", self.open_version_folder, width=176, height=36, fs=10,
-                    bg=C["bg0"]).pack(side="bottom", pady=(0, 12))
-        PixelButton(sb, "ПАПКА MINECRAFT", self.open_minecraft_folder, width=176, height=36, fs=10,
+            self.nav[key] = (row, bar, lab, ico)
+        # профиль внизу: клик ведёт в «Аккаунты»
+        card = tk.Frame(sb, bg=C["card"], highlightbackground=C["line"], highlightthickness=1, cursor="hand2")
+        card.pack(side="bottom", fill="x", padx=14, pady=(0, 16))
+        self.av = tk.Canvas(card, width=44, height=44, bg=C["card"], highlightthickness=0, cursor="hand2")
+        self.av.pack(side="left", padx=(10, 8), pady=10)
+        col = tk.Frame(card, bg=C["card"], cursor="hand2")
+        col.pack(side="left", fill="x", expand=True)
+        self.prof_name = tk.Label(col, text="", bg=C["card"], fg=C["text"], font=font(11, True), anchor="w",
+                                  cursor="hand2")
+        self.prof_name.pack(fill="x")
+        self.prof_type = tk.Label(col, text="", bg=C["card"], fg=C["muted"], font=font(9), anchor="w",
+                                  cursor="hand2")
+        self.prof_type.pack(fill="x")
+        for w in (card, self.av, col, self.prof_name, self.prof_type):
+            w.bind("<Button-1>", lambda e: self.show_page("accounts"))
+        PixelButton(sb, "Папка Minecraft", self.open_minecraft_folder, width=222, height=34, fs=10,
                     bg=C["bg0"]).pack(side="bottom", pady=(0, 8))
+        PixelButton(sb, "Папка версии", self.open_version_folder, width=222, height=34, fs=10,
+                    bg=C["bg0"]).pack(side="bottom", pady=(0, 8))
+
+    def _update_profile(self):
+        if not hasattr(self, "prof_name"):
+            return
+        a = self.active_account()
+        name = a["name"] if a else "—"
+        self.prof_name.configure(text=name)
+        self.prof_type.configure(text=("Аккаунт: " + ACC_TYPES.get(a["type"], a["type"])) if a else "")
+        cols = [C["orange"], C["violet"], C["pink"], C["blue"], C["green"]]
+        colr = cols[sum(map(ord, name)) % len(cols)]
+        cv = self.av
+        cv.delete("all")
+        cv.create_oval(2, 2, 42, 42, fill=colr, outline="")
+        cv.create_text(22, 22, text=(name[:1] or "?").upper(), fill="#15101f", font=font(15, True))
 
     def _nav_hover(self, key, on):
         self._nav_to(key, 1.0 if (on or key == self.page) else 0.0)
@@ -2009,7 +2174,7 @@ class App:
             self._nav_step(key)
 
     def _nav_step(self, key):
-        row, bar, lab = self.nav[key]
+        row, bar, lab, ico = self.nav[key]
         lv, tgt = self._nav_lv.get(key, 0.0), self._nav_t.get(key, 0.0)
         d = tgt - lv
         if abs(d) < 0.03:
@@ -2019,10 +2184,13 @@ class App:
             self._nav_job[key] = self.root.after(16, lambda: self._nav_step(key))
         self._nav_lv[key] = lv
         sel = key == self.page
-        bgc = _mix(C["bg0"], C["bg2"] if sel else C["hover"], min(1.0, lv))
-        row.configure(bg=bgc)
-        lab.configure(bg=bgc, fg=_mix(C["muted"], C["text"], min(1.0, lv)))
-        bar.configure(bg=_mix(bgc, C["yellow"], 1.0 if sel else 0.0), width=max(1, int(4 * lv)) if sel else 4)
+        k = min(1.0, lv)
+        bgc = _mix(C["bg0"], C["bg2"] if sel else C["hover"], k)
+        for w in (row, lab, ico):
+            w.configure(bg=bgc)
+        lab.configure(fg=_mix(C["muted"], C["text"], k))
+        ico.configure(fg=_mix(C["muted"], C["yellow"] if sel else C["text"], k))
+        bar.configure(bg=_mix(bgc, C["yellow"], 1.0 if sel else 0.0), width=4)
 
     def show_page(self, key):
         self.page = key
@@ -2038,13 +2206,14 @@ class App:
 
     # ───── помощники ─────
     def _section(self, parent, title):
-        f = tk.Frame(parent, bg=C["bg1"])
-        tk.Label(f, text=title, bg=C["bg1"], fg=C["yellow"], font=font(12, True)).pack(anchor="w")
-        tk.Frame(f, bg=C["line"], height=1).pack(fill="x", pady=(4, 10))
+        f = tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
+                     padx=16, pady=14)
+        tk.Label(f, text=title, bg=C["card"], fg=C["yellow"], font=font(12, True)).pack(anchor="w")
+        tk.Frame(f, bg=C["line"], height=1).pack(fill="x", pady=(6, 10))
         return f
 
     def _label(self, parent, text, muted=False, wrap=0, bg=None):
-        return tk.Label(parent, text=text, bg=bg or C["bg1"], fg=C["muted"] if muted else C["text"],
+        return tk.Label(parent, text=text, bg=bg or parent.cget("bg"), fg=C["muted"] if muted else C["text"],
                         font=font(10), anchor="w", justify="left", wraplength=wrap)
 
     def _entry(self, parent, var, width=22, show=None):
@@ -2061,13 +2230,13 @@ class App:
                             width=width, style="U.TCombobox", font=font(10))
 
     def _listbox(self, parent, width=28, height=12):
-        return tk.Listbox(parent, width=width, height=height, bg=C["input"], fg=C["text"],
-                          selectbackground=C["yellow"], selectforeground=C["brown"],
+        return tk.Listbox(parent, width=width, height=height, bg=C["card"], fg=C["text"],
+                          selectbackground=C["violet_lo"], selectforeground="#ffffff",
                           highlightthickness=0, relief="flat", bd=0, font=font(11),
                           activestyle="none", exportselection=False)
 
-    def _title(self, parent, text):
-        return tk.Label(parent, text=text, bg=C["bg1"], fg=C["yellow"], font=font(20, True))
+    def _title(self, parent, text, sub=""):
+        return Banner(parent, _nice(text) if text.isupper() else text, sub, height=70)
 
     # ───── страницы ─────
     def _build_pages(self, parent):
@@ -2088,31 +2257,88 @@ class App:
         self._build_log(self.pages["log"])
 
     # --- главная
+    def _card(self, parent, **kw):
+        return tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
+                        padx=16, pady=14, **kw)
+
+    def _tile(self, parent, key, title, accent, on_click):
+        card = tk.Frame(parent, bg=C["card"], highlightbackground=C["line"], highlightthickness=1,
+                        cursor="hand2")
+        tk.Frame(card, bg=accent, height=3).pack(fill="x")
+        inner = tk.Frame(card, bg=C["card"], cursor="hand2")
+        inner.pack(fill="both", expand=True, padx=16, pady=(11, 14))
+        cap = tk.Label(inner, text=title.upper(), bg=C["card"], fg=C["muted"], font=font(9, True),
+                       anchor="w", cursor="hand2")
+        cap.pack(anchor="w")
+        val = tk.Label(inner, text="", bg=C["card"], fg=C["text"], font=font(12, True), anchor="w",
+                       justify="left", wraplength=220, cursor="hand2")
+        val.pack(anchor="w", fill="x", pady=(5, 0))
+        card.bind("<Configure>", lambda e, v=val: v.configure(wraplength=max(120, e.width - 40)))
+        for w in (card, inner, cap, val):
+            w.bind("<Button-1>", lambda e: on_click())
+            w.bind("<Enter>", lambda e: card.configure(highlightbackground=accent))
+            w.bind("<Leave>", lambda e: card.configure(highlightbackground=C["line"]))
+        self.sum[key] = val
+        return card
+
     def _build_home(self, page):
         pad = tk.Frame(page, bg=C["bg1"])
-        pad.pack(fill="both", expand=True, padx=30, pady=22)
-        self._title(pad, "ГОТОВ К ИГРЕ").pack(anchor="w")
-        self._label(pad, "Выберите версию или сборку и аккаунт внизу, затем нажмите «Играть».",
-                    muted=True).pack(anchor="w", pady=(2, 16))
-        card = tk.Frame(pad, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
-        card.pack(fill="x")
-        grid = tk.Frame(card, bg=C["bg0"])
-        grid.pack(fill="x", padx=18, pady=12)
-        grid.columnconfigure(1, weight=1)
+        pad.pack(fill="both", expand=True, padx=24, pady=20)
+        self.hero = Banner(pad, "Привет!", "Выберите версию внизу и нажмите «Играть»", height=148, big=True)
+        self.hero.pack(fill="x")
+        grid = tk.Frame(pad, bg=C["bg1"])
+        grid.pack(fill="x", pady=(16, 0))
+        for c in range(3):
+            grid.columnconfigure(c, weight=1, uniform="t")
         self.sum = {}
-        for r, (key, title) in enumerate((("launch", "Запуск"), ("acc", "Аккаунт"), ("folder", "Папка игры"),
-                                          ("mem", "Память"), ("flags", "Профиль флагов"), ("java", "Java"))):
-            tk.Label(grid, text=title.upper(), bg=C["bg0"], fg=C["muted"], font=font(10, True),
-                     anchor="w").grid(row=r, column=0, sticky="w", pady=2)
-            v = tk.Label(grid, text="", bg=C["bg0"], fg=C["text"], font=font(10, True), anchor="w",
-                         justify="left", wraplength=560)
-            v.grid(row=r, column=1, sticky="w", padx=(24, 0), pady=2)
-            self.sum[key] = v
-        sec = self._section(pad, "Советы")
-        sec.pack(fill="x", pady=(20, 0))
-        for t in TIPS:
-            tk.Label(sec, text="•  " + t, bg=C["bg1"], fg=C["text"], font=font(10), anchor="w",
-                     justify="left", wraplength=640).pack(anchor="w", pady=2)
+        tiles = (("launch", "Запуск", C["orange"], lambda: self.show_page("builds")),
+                 ("acc", "Аккаунт", C["violet"], lambda: self.show_page("accounts")),
+                 ("folder", "Папка игры", C["blue"], self.open_version_folder),
+                 ("mem", "Память", C["green"], lambda: self.show_page("settings")),
+                 ("flags", "Профиль флагов", C["pink"], lambda: self.show_page("settings")),
+                 ("java", "Java", C["yellow"], lambda: self.show_page("settings")))
+        for i, (key, title, accent, cmd) in enumerate(tiles):
+            self._tile(grid, key, title, accent, cmd).grid(row=i // 3, column=i % 3, sticky="nsew",
+                                                           padx=(0 if i % 3 == 0 else 6, 0 if i % 3 == 2 else 6),
+                                                           pady=(0 if i < 3 else 12, 0))
+        row2 = tk.Frame(pad, bg=C["bg1"])
+        row2.pack(fill="both", expand=True, pady=(16, 0))
+        row2.columnconfigure(0, weight=1, uniform="r")
+        row2.columnconfigure(1, weight=1, uniform="r")
+        row2.rowconfigure(0, weight=1)
+        qa = self._card(row2)
+        qa.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(qa, text="Быстрые действия", bg=C["card"], fg=C["yellow"], font=font(12, True)).pack(anchor="w")
+        bt = tk.Frame(qa, bg=C["card"])
+        bt.pack(anchor="w", pady=(10, 0))
+        acts = (("Сборки", lambda: self.show_page("builds")), ("Моды", lambda: self.show_page("mods")),
+                ("Папка игры", self.open_version_folder), ("Настройки", lambda: self.show_page("settings")))
+        for i, (t, cmd) in enumerate(acts):
+            PixelButton(bt, t, cmd, width=168, height=40, fs=10).grid(row=i // 2, column=i % 2,
+                                                                      padx=(0, 8), pady=(0, 6))
+        tp = self._card(row2)
+        tp.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        head = tk.Frame(tp, bg=C["card"])
+        head.pack(fill="x")
+        tk.Label(head, text="Совет", bg=C["card"], fg=C["yellow"], font=font(12, True)).pack(side="left")
+        self.tip_no = tk.Label(head, text=f"1 / {len(TIPS)}", bg=C["card"], fg=C["muted"], font=font(9))
+        self.tip_no.pack(side="right")
+        self._tip_i = 0
+        self.tip_lbl = tk.Label(tp, text=TIPS[0], bg=C["card"], fg=C["text"], font=font(11), anchor="nw",
+                                justify="left", wraplength=360)
+        self.tip_lbl.pack(anchor="w", fill="x", pady=(10, 0))
+        tp.bind("<Configure>", lambda e: self.tip_lbl.configure(wraplength=max(160, e.width - 40)))
+        nxt = tk.Label(tp, text="Следующий совет  \u2192", bg=C["card"], fg=C["violet"], font=font(10, True),
+                       cursor="hand2")
+        nxt.pack(anchor="w", side="bottom")
+        nxt.bind("<Button-1>", lambda e: self._next_tip())
+        nxt.bind("<Enter>", lambda e: nxt.configure(fg=C["text"]))
+        nxt.bind("<Leave>", lambda e: nxt.configure(fg=C["violet"]))
+
+    @staticmethod
+    def _short_path(p, keep=3):
+        parts = Path(p).parts
+        return str(p) if len(parts) <= keep + 1 else "\u2026" + os.sep + os.sep.join(parts[-keep:])
 
     def update_summary(self):
         if not hasattr(self, "sum"):
@@ -2122,11 +2348,19 @@ class App:
         acct = self.active_account()
         self.sum["launch"].configure(text=self.v_launch.get() or "—")
         self.sum["acc"].configure(text=account_label(acct) if acct else "—")
-        self.sum["folder"].configure(text=str(tgt["game_dir"]) if tgt else "—")
+        self.sum["folder"].configure(text=self._short_path(tgt["game_dir"]) if tgt else "—")
         self.sum["mem"].configure(text=f"{g['ram']} МБ  (старт {min(g['xms'], g['ram'])} МБ)")
         extra = f"  + {len(g['extra_flags'])} доп." if g["extra_flags"] else ""
         self.sum["flags"].configure(text=FLAG_PRESETS.get(g["preset"], FLAG_PRESETS["aikar"])[0] + extra)
         self.sum["java"].configure(text="своя" if g["java_path"] else "авто (официальная от Mojang)")
+        self._update_profile()
+        if hasattr(self, "hero"):
+            nm = acct["name"] if acct else "игрок"
+            sub = (f"Готов запустить {self.v_launch.get()}" if self.v_launch.get()
+                   else "Выберите версию внизу и нажмите «Играть»")
+            if getattr(self, "_hero_key", None) != (nm, sub):
+                self._hero_key = (nm, sub)
+                self.hero.set_text(f"Привет, {nm}!", sub)
 
     # --- сборки
     def _build_builds(self, page):
@@ -2134,7 +2368,8 @@ class App:
         pad.pack(fill="both", expand=True, padx=26, pady=20)
         pad.columnconfigure(1, weight=1)
         pad.rowconfigure(1, weight=1)
-        self._title(pad, "СБОРКИ").grid(row=0, column=0, columnspan=2, sticky="w")
+        self._title(pad, "Сборки", "Отдельные папки с модами, мирами и настройками").grid(
+            row=0, column=0, columnspan=2, sticky="ew")
         left = tk.Frame(pad, bg=C["bg1"])
         left.grid(row=1, column=0, sticky="ns", padx=(0, 20), pady=(12, 0))
         box = tk.Frame(left, bg=C["line"])
@@ -2272,10 +2507,11 @@ class App:
     def _build_mods(self, page):
         pad = tk.Frame(page, bg=C["bg1"])
         pad.pack(fill="both", expand=True, padx=22, pady=14)
+        self._title(pad, "Моды и ресурсы", "Поиск и установка с Modrinth").pack(
+            fill="x", pady=(0, 10))
         self.mods_target = tk.Label(pad, text="", bg=C["bg1"], fg=C["yellow"], font=font(10, True),
                                     anchor="w", justify="left", wraplength=760)
         self.mods_target.pack(fill="x")
-        self.v_src = tk.StringVar(value=self.cfg.get("mods_source", "Modrinth"))
         self.v_ctype = tk.StringVar(value="Моды")
         self.v_mloader = tk.StringVar(value="Fabric")
         self.v_sort = tk.StringVar(value="По скачиваниям")
@@ -2283,8 +2519,7 @@ class App:
         self.v_query = tk.StringVar()
         f1 = tk.Frame(pad, bg=C["bg1"])
         f1.pack(fill="x", pady=(8, 0))
-        for text, var, vals, w in (("Источник", self.v_src, ["Modrinth", "CurseForge"], 12),
-                                   ("Тип", self.v_ctype, [v[0] for v in CONTENT_TYPES.values()], 12),
+        for text, var, vals, w in (("Тип", self.v_ctype, [v[0] for v in CONTENT_TYPES.values()], 12),
                                    ("Загрузчик", self.v_mloader, LOADER_CHOICES, 10),
                                    ("Сортировка", self.v_sort, list(SORTS), 18)):
             col = tk.Frame(f1, bg=C["bg1"])
@@ -2294,15 +2529,19 @@ class App:
         f2 = tk.Frame(pad, bg=C["bg1"])
         f2.pack(fill="x", pady=(10, 0))
         ent = self._entry(f2, self.v_query, 30)
-        ent.pack(side="left", ipady=4)
+        ent.pack(side="left", ipady=6, fill="x", expand=True)
         ent.bind("<Return>", lambda e: self.mods_search())
         PixelButton(f2, "ИСКАТЬ", self.mods_search, width=110, height=34, fs=10).pack(side="left", padx=8)
         PixelCheck(f2, "Только для моей версии", self.v_mc_only).pack(side="left", padx=8)
         f3 = tk.Frame(pad, bg=C["bg1"])
         f3.pack(fill="x", pady=(10, 6))
-        PixelButton(f3, "ПОИСК", lambda: self.set_mods_tab("search"), width=110, height=32, fs=10).pack(side="left")
-        PixelButton(f3, "УСТАНОВЛЕННЫЕ", lambda: self.set_mods_tab("installed"), width=170, height=32,
-                    fs=10).pack(side="left", padx=6)
+        self.tab_btn = {}
+        self.tab_btn["search"] = PixelButton(f3, "ПОИСК", lambda: self.set_mods_tab("search"), width=110,
+                                             height=32, fs=10)
+        self.tab_btn["search"].pack(side="left")
+        self.tab_btn["installed"] = PixelButton(f3, "УСТАНОВЛЕННЫЕ", lambda: self.set_mods_tab("installed"),
+                                                width=170, height=32, fs=10)
+        self.tab_btn["installed"].pack(side="left", padx=6)
         PixelButton(f3, "ПАПКА", self.open_content_folder, width=90, height=32, fs=10).pack(side="left")
         stack = tk.Frame(pad, bg=C["bg1"])
         stack.pack(fill="both", expand=True)
@@ -2327,6 +2566,9 @@ class App:
         self.set_mods_tab("search")
 
     def set_mods_tab(self, tab):
+        for k, b in getattr(self, "tab_btn", {}).items():
+            b._primary = (k == tab)
+            b._draw()
         if tab == "installed":
             self.tab_installed.tkraise()
             self.scrolls["mods"] = self.inst_scroll
@@ -2368,26 +2610,17 @@ class App:
         if not more:
             ctype = self._ctype()
             loader = LOADER_KEY.get(self.v_mloader.get()) if ctype == "mods" else None
-            self._sq = dict(src=self.v_src.get().lower(), ctype=ctype,
+            self._sq = dict(ctype=ctype,
                             mc=tgt["mc"] if self.v_mc_only.get() else None, loader=loader,
                             sort=SORTS.get(self.v_sort.get(), "downloads"),
                             query=self.v_query.get().strip(), offset=0)
         q = dict(self._sq)
-        key = self.v_cf_key.get().strip()
-        if q["src"] == "curseforge" and not key:
-            # ключ CurseForge необязателен: без него просто ищем на Modrinth
-            q["src"] = "modrinth"
-            self._sq["src"] = "modrinth"
-            self.v_src.set("Modrinth")
         self._busy_search = True
         self.mods_status("Ищу...")
 
         def work():
             try:
-                if q["src"] == "modrinth":
-                    items, total = modrinth_search(q["query"], q["ctype"], q["mc"], q["loader"], q["sort"], q["offset"])
-                else:
-                    items, total = cf_search(key, q["query"], q["ctype"], q["mc"], q["loader"], q["sort"], q["offset"])
+                items, total = modrinth_search(q["query"], q["ctype"], q["mc"], q["loader"], q["sort"], q["offset"])
                 self.ui(lambda: self.render_results(items, total, more))
             except Exception as e:
                 self.ui(lambda m=str(e): self.mods_status("Ошибка поиска: " + m))
@@ -2410,19 +2643,19 @@ class App:
                          else "Ничего не найдено — попробуйте другой запрос или снимите фильтр версии")
 
     def _result_row(self, body, it):
-        row = tk.Frame(body, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
+        row = tk.Frame(body, bg=C["card"], highlightbackground=C["line"], highlightthickness=1)
         row.pack(fill="x", pady=4, padx=(0, 6))
         row.columnconfigure(0, weight=1)
-        info = tk.Frame(row, bg=C["bg0"])
+        info = tk.Frame(row, bg=C["card"])
         info.grid(row=0, column=0, sticky="ew", padx=12, pady=8)
-        tk.Label(info, text=it["title"], bg=C["bg0"], fg=C["text"], font=font(11, True),
+        tk.Label(info, text=it["title"], bg=C["card"], fg=C["text"], font=font(11, True),
                  anchor="w").pack(anchor="w")
-        tk.Label(info, text=f"{it['author']}   ·   скачиваний: {fmt_num(it['downloads'])}", bg=C["bg0"],
+        tk.Label(info, text=f"{it['author']}   ·   скачиваний: {fmt_num(it['downloads'])}", bg=C["card"],
                  fg=C["yellow"], font=font(9), anchor="w").pack(anchor="w")
-        tk.Label(info, text=it["desc"], bg=C["bg0"], fg=C["muted"], font=font(9), anchor="w",
+        tk.Label(info, text=it["desc"], bg=C["card"], fg=C["muted"], font=font(9), anchor="w",
                  justify="left", wraplength=480).pack(anchor="w")
         PixelButton(row, "СКАЧАТЬ", lambda i=it: self.mods_install(i), width=120, height=36, fs=10,
-                    bg=C["bg0"]).grid(row=0, column=1, padx=12)
+                    bg=C["card"]).grid(row=0, column=1, padx=12)
 
     def mods_install(self, it):
         tgt = self.current_target()
@@ -2436,27 +2669,16 @@ class App:
             loader = None
         mc = tgt["mc"]
         dest = tgt["game_dir"] / folder
-        key = self.v_cf_key.get().strip()
         self.mods_status(f"Скачиваю: {it['title']}...")
 
         def work():
             try:
-                if it["source"] == "modrinth":
-                    done = modrinth_install(it["id"], ctype, mc, loader, dest, self.log)
-                else:
-                    done = cf_install(key, it["id"], ctype, mc, loader, dest, self.log, it.get("url", ""))
+                done = modrinth_install(it["id"], ctype, mc, loader, dest, self.log)
                 self.ui(lambda n=len(done): (self.mods_status(f"Готово: {it['title']} (файлов: {n})"),
                                              self.refresh_installed()))
-            except ManualDownload as e:
-                self.ui(lambda u=e.url: self._manual_download(u))
             except Exception as e:
                 self.ui(lambda m=str(e): self.mods_status("Ошибка: " + m))
         threading.Thread(target=work, daemon=True).start()
-
-    def _manual_download(self, url):
-        self.mods_status("Автор запретил автоматическую загрузку — открываю страницу CurseForge")
-        if url:
-            webbrowser.open(url)
 
     def refresh_installed(self):
         if not hasattr(self, "inst_scroll"):
@@ -2475,15 +2697,15 @@ class App:
             return
         for f in files:
             off = f.name.endswith(".disabled")
-            row = tk.Frame(body, bg=C["bg0"], highlightbackground=C["line"], highlightthickness=1)
+            row = tk.Frame(body, bg=C["card"], highlightbackground=C["line"], highlightthickness=1)
             row.pack(fill="x", pady=3, padx=(0, 6))
-            tk.Label(row, text=("[выкл]  " if off else "") + f.name.replace(".disabled", ""), bg=C["bg0"],
+            tk.Label(row, text=("[выкл]  " if off else "") + f.name.replace(".disabled", ""), bg=C["card"],
                      fg=C["muted"] if off else C["text"], font=font(10), anchor="w").pack(
                 side="left", padx=12, pady=8)
             PixelButton(row, "УДАЛИТЬ", lambda p=f: self.mod_delete(p), width=96, height=30, fs=9,
-                        bg=C["bg0"]).pack(side="right", padx=8, pady=4)
+                        bg=C["card"]).pack(side="right", padx=8, pady=4)
             PixelButton(row, "ВКЛЮЧИТЬ" if off else "ВЫКЛЮЧИТЬ", lambda p=f: self.mod_toggle(p),
-                        width=116, height=30, fs=9, bg=C["bg0"]).pack(side="right", pady=4)
+                        width=116, height=30, fs=9, bg=C["card"]).pack(side="right", pady=4)
 
     def mod_toggle(self, path):
         try:
@@ -2509,7 +2731,8 @@ class App:
         pad.pack(fill="both", expand=True, padx=26, pady=20)
         pad.columnconfigure(1, weight=1)
         pad.rowconfigure(1, weight=1)
-        self._title(pad, "АККАУНТЫ").grid(row=0, column=0, columnspan=2, sticky="w")
+        self._title(pad, "Аккаунты", "Офлайн, Ely.by и Microsoft — у каждого свои скины").grid(
+            row=0, column=0, columnspan=2, sticky="ew")
         left = tk.Frame(pad, bg=C["bg1"])
         left.grid(row=1, column=0, sticky="ns", padx=(0, 20), pady=(12, 0))
         box = tk.Frame(left, bg=C["line"])
@@ -2756,23 +2979,25 @@ class App:
         pad.pack(fill="both", expand=True, padx=26, pady=20)
         pad.columnconfigure(0, weight=1, uniform="col")
         pad.columnconfigure(1, weight=1, uniform="col")
+        self._title(pad, "Настройки", "Память, оптимизация Java, окно игры и сам лаунчер").grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 16))
         left = tk.Frame(pad, bg=C["bg1"])
-        left.grid(row=0, column=0, sticky="new", padx=(0, 14))
+        left.grid(row=1, column=0, sticky="new", padx=(0, 14))
         right = tk.Frame(pad, bg=C["bg1"])
-        right.grid(row=0, column=1, sticky="new", padx=(14, 0))
+        right.grid(row=1, column=1, sticky="new", padx=(14, 0))
 
         # --- память
         s = self._section(left, "Память")
         s.pack(fill="x", pady=(0, 14))
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(fill="x")
         self._label(row, "Максимум (Xmx)").pack(side="left")
-        self.ram_label = tk.Label(row, text="", bg=C["bg1"], fg=C["yellow"], font=font(11, True))
+        self.ram_label = tk.Label(row, text="", bg=C["card"], fg=C["yellow"], font=font(11, True))
         self.ram_label.pack(side="right")
         PixelSlider(s, self.v_ram, 1024, self.max_ram, 256).pack(fill="x", pady=(4, 6))
         self.v_ram.trace_add("write", lambda *a: self._ram_text())
         self._ram_text()
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(fill="x", pady=(2, 4))
         self._label(row, "Старт (Xms, МБ)").pack(side="left")
         tk.Spinbox(row, from_=256, to=self.max_ram, increment=256, textvariable=self.v_xms, width=7,
@@ -2780,7 +3005,7 @@ class App:
                    buttonbackground=C["bg2"], relief="flat", highlightthickness=2,
                    highlightbackground=C["line"], highlightcolor=C["yellow"],
                    font=font(11)).pack(side="right")
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(fill="x", pady=(6, 0))
         PixelButton(row, "АВТО", self.auto_ram, width=90, height=30, fs=9).pack(side="left")
         self._label(row, f"  всего ОЗУ: {self.total_ram} МБ", muted=True).pack(side="left")
@@ -2808,25 +3033,27 @@ class App:
             anchor="w", pady=2)
         PixelCheck(s, "Проверять целостность файлов при запуске", self.v_verify).pack(anchor="w", pady=2)
         PixelCheck(s, "Показывать команду запуска в логе", self.v_showcmd).pack(anchor="w", pady=2)
-        r1 = tk.Frame(s, bg=C["bg1"])
+        r1 = tk.Frame(s, bg=C["card"])
         r1.pack(anchor="w", pady=(8, 0))
         PixelButton(r1, "ПАПКА MINECRAFT", self.open_minecraft_folder, width=178, height=34, fs=9).pack(side="left")
         PixelButton(r1, "ПАПКА ВЕРСИИ", self.open_version_folder, width=160, height=34, fs=9).pack(
             side="left", padx=6)
-        r2 = tk.Frame(s, bg=C["bg1"])
+        r2 = tk.Frame(s, bg=C["card"])
         r2.pack(anchor="w", pady=(6, 0))
         PixelButton(r2, "БЭКАП МИРОВ", self.do_backup, width=140, height=34, fs=9).pack(side="left")
         PixelButton(r2, "ИМПОРТ ИЗ .MINECRAFT", self.do_import, width=210, height=34, fs=9).pack(
             side="left", padx=6)
-        r3 = tk.Frame(s, bg=C["bg1"])
+        r3 = tk.Frame(s, bg=C["card"])
         r3.pack(anchor="w", pady=(6, 0))
-        PixelButton(r3, "СБРОС НАСТРОЕК", self.reset_settings, width=170, height=34, fs=9).pack(side="left")
+        PixelButton(r3, "ЯРЛЫК НА РАБОЧИЙ СТОЛ", self.do_shortcut, width=230, height=34, fs=9).pack(side="left")
+        PixelButton(r3, "СБРОС НАСТРОЕК", self.reset_settings, width=170, height=34, fs=9).pack(
+            side="left", padx=6)
 
         # --- игра
         s = self._section(right, "Игра")
         s.pack(fill="x", pady=(0, 14))
         PixelCheck(s, "Свой размер окна", self.v_custom_res).pack(anchor="w")
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(anchor="w", pady=6)
         self._entry(row, self.v_w, 6).pack(side="left")
         self._label(row, "  ×  ").pack(side="left")
@@ -2838,7 +3065,7 @@ class App:
         # --- java
         s = self._section(right, "Java")
         s.pack(fill="x", pady=(0, 14))
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(fill="x")
         self._entry(row, self.v_java, 24).pack(side="left", fill="x", expand=True, padx=(0, 8))
         PixelButton(row, "ОБЗОР", self.browse_java, width=90, height=34, fs=10).pack(side="right")
@@ -2850,10 +3077,8 @@ class App:
         s.pack(fill="x", pady=(0, 14))
         self._label(s, "Microsoft Client ID (необязательно)").pack(anchor="w")
         self._entry(s, self.v_ms_cid, 30).pack(fill="x", pady=(4, 8))
-        self._label(s, "API-ключ CurseForge (необязательно)").pack(anchor="w")
-        self._entry(s, self.v_cf_key, 30, show="•").pack(fill="x", pady=(4, 0))
-        self._label(s, "Без ключа моды ищутся на Modrinth, там есть почти все популярные. Ключ выдаёт console.curseforge.com.", muted=True,
-                    wrap=380).pack(anchor="w", pady=(6, 0))
+        self._label(s, "Нужен только для входа через Microsoft. Моды ищутся на Modrinth, ключи не нужны.",
+                    muted=True, wrap=380).pack(anchor="w", pady=(2, 0))
 
         # --- лаунчер
         s = self._section(right, "Лаунчер")
@@ -2866,7 +3091,7 @@ class App:
                 ("Показывать снапшоты", self.v_snap, self.refresh_targets),
                 ("Старые версии (beta/alpha, эксперимент.)", self.v_old, self.refresh_targets)):
             PixelCheck(s, text, var, cmd).pack(anchor="w", pady=3)
-        row = tk.Frame(s, bg=C["bg1"])
+        row = tk.Frame(s, bg=C["card"])
         row.pack(anchor="w", pady=(6, 0))
         self._label(row, "Скорость анимации  ").pack(side="left")
         self._combo(row, self.v_speed, list(self.SPEEDS), 12).pack(side="left")
@@ -2944,6 +3169,20 @@ class App:
                 self.ui(lambda m=str(e): messagebox.showerror(APP_NAME, m))
         threading.Thread(target=work, daemon=True).start()
 
+    def do_shortcut(self):
+        self.status.configure(text="Создаю ярлык...")
+
+        def work():
+            try:
+                p = create_desktop_shortcut()
+                self.ui(lambda: (self.status.configure(text="Ярлык создан"),
+                                 messagebox.showinfo(APP_NAME, f"Ярлык создан на рабочем столе:\n{p}\n\n"
+                                                     "Значок у него тот же (ueban.ico), что и у лаунчера.")))
+            except Exception as e:
+                self.ui(lambda m=str(e): (self.status.configure(text="Не удалось создать ярлык"),
+                                          messagebox.showerror(APP_NAME, m)))
+        threading.Thread(target=work, daemon=True).start()
+
     def reset_settings(self):
         if not messagebox.askyesno(APP_NAME, "Сбросить все настройки? Аккаунты и сборки останутся."):
             return
@@ -2956,6 +3195,8 @@ class App:
     def _build_log(self, page):
         pad = tk.Frame(page, bg=C["bg1"])
         pad.pack(fill="both", expand=True, padx=22, pady=18)
+        self._title(pad, "Лог игры", "Здесь видно, что делает лаунчер и почему игра могла не запуститься").pack(
+            fill="x", pady=(0, 10))
         box = tk.Frame(pad, bg=C["line"])
         box.pack(fill="both", expand=True)
         self.text = tk.Text(box, wrap="word", state="disabled", bg=C["input"], fg=C["text"],
@@ -2976,7 +3217,7 @@ class App:
         bottom.grid(row=1, column=0, columnspan=2, sticky="ew")
         tk.Frame(bottom, bg=C["line"], height=1).pack(fill="x")
         strip = tk.Frame(bottom, bg=C["bg0"])
-        strip.pack(fill="x", padx=16, pady=(8, 0))
+        strip.pack(fill="x", padx=24, pady=(10, 0))
         self.status = tk.Label(strip, text="Загрузка списка версий...", bg=C["bg0"], fg=C["muted"],
                                font=font(9), anchor="w")
         self.status.pack(fill="x")
@@ -2984,7 +3225,7 @@ class App:
         self.pbar.pack(fill="x", pady=(3, 0))
 
         ctrl = tk.Frame(bottom, bg=C["bg0"])
-        ctrl.pack(fill="x", padx=16, pady=12)
+        ctrl.pack(fill="x", padx=24, pady=(10, 16))
         ctrl.columnconfigure(0, weight=1, uniform="c")
         ctrl.columnconfigure(1, weight=0)
         ctrl.columnconfigure(2, weight=1, uniform="c")
@@ -2992,19 +3233,20 @@ class App:
         left = tk.Frame(ctrl, bg=C["bg0"])
         left.grid(row=0, column=0, sticky="w")
         tk.Label(left, text="ВЕРСИЯ / СБОРКА", bg=C["bg0"], fg=C["muted"], font=font(9, True)).pack(anchor="w")
-        self.combo = ttk.Combobox(left, textvariable=self.v_launch, state="readonly", width=26,
-                                  style="U.TCombobox", font=font(10))
-        self.combo.pack(pady=(3, 0))
+        self.combo = ttk.Combobox(left, textvariable=self.v_launch, state="readonly", width=28,
+                                  style="U.TCombobox", font=font(11))
+        self.combo.pack(pady=(4, 0))
 
-        self.play = PixelButton(ctrl, "ИГРАТЬ", self.on_play, width=280, height=58, fs=17, bg=C["bg0"], kind="primary", pulse=True)
+        self.play = PixelButton(ctrl, "ИГРАТЬ", self.on_play, width=320, height=64, fs=18, bg=C["bg0"],
+                                kind="primary", pulse=True)
         self.play.grid(row=0, column=1)
 
         right = tk.Frame(ctrl, bg=C["bg0"])
         right.grid(row=0, column=2, sticky="e")
         tk.Label(right, text="АККАУНТ", bg=C["bg0"], fg=C["muted"], font=font(9, True)).pack(anchor="w")
-        self.acc_combo = ttk.Combobox(right, textvariable=self.v_account, state="readonly", width=24,
-                                      style="U.TCombobox", font=font(10))
-        self.acc_combo.pack(pady=(3, 0))
+        self.acc_combo = ttk.Combobox(right, textvariable=self.v_account, state="readonly", width=26,
+                                      style="U.TCombobox", font=font(11))
+        self.acc_combo.pack(pady=(4, 0))
         self.acc_combo.bind("<<ComboboxSelected>>", self.on_account_combo)
 
     # ───── версии и цели запуска ─────
@@ -3182,6 +3424,8 @@ class App:
 
 def main():
     BASE.mkdir(parents=True, exist_ok=True)
+    set_app_id()
+    ensure_icon_file()
     root = tk.Tk()
     App(root)
     root.mainloop()
