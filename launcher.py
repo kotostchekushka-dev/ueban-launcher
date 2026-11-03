@@ -34,6 +34,7 @@ from pathlib import Path
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
+    import tkinter.font as tkfont
 except ImportError:  # для тестов без GUI
     tk = None
 
@@ -1306,6 +1307,33 @@ C = {
 FONT = "Segoe UI" if IS_WIN else "Helvetica"
 
 
+def _load_pixel_font():
+    """Подключает Monocraft.ttf (лежит рядом с лаунчером) для кнопок. Windows: без установки в систему."""
+    path = resource_path("Monocraft.ttf")
+    if not os.path.exists(path):
+        return FONT
+    try:
+        if IS_WIN:
+            import ctypes
+            # FR_PRIVATE = 0x10: шрифт виден только этому процессу
+            if ctypes.windll.gdi32.AddFontResourceExW(path, 0x10, 0):
+                return "Monocraft"
+        elif OS_NAME == "linux":
+            d = Path.home() / ".local" / "share" / "fonts"
+            d.mkdir(parents=True, exist_ok=True)
+            dst = d / "Monocraft.ttf"
+            if not dst.exists():
+                shutil.copyfile(path, dst)
+                subprocess.run(["fc-cache", "-f", str(d)], timeout=20)
+            return "Monocraft"
+    except Exception:
+        pass
+    return FONT
+
+
+BTN_FONT = _load_pixel_font()
+
+
 def font(size=10, bold=False):
     """Размер задан в «точках», но переводится в пиксели — интерфейс не плывёт при разном DPI."""
     return (FONT, -int(round(size * 1.35)), "bold" if bold else "normal")
@@ -1371,16 +1399,16 @@ if tk is not None:
         return s
 
     class AnimatedBG(tk.Canvas):
-        """Фон: тёмный градиент и мягкие светящиеся шары, которые медленно плывут."""
-        ORBS = [("#ff8a1f", 0.30, 0.00, 0.9, 0.7, 0.8), ("#9d7bff", 0.30, 1.9, 0.7, 1.1, 0.6),
-                ("#ff4f9a", 0.22, 3.7, 1.1, 0.8, 0.5), ("#4aa8ff", 0.18, 5.1, 0.6, 0.9, 0.4)]
+        """Фон: плавно переливающийся диагональный градиент между жёлтым и оранжевым."""
+        C_YELLOW, C_ORANGE = "#ffd23f", "#ff7a14"
+        BANDS = 80
 
         def __init__(self, master):
-            super().__init__(master, highlightthickness=0, bd=0, bg=C["bg0"])
+            super().__init__(master, highlightthickness=0, bd=0, bg=self.C_ORANGE)
             self.enabled = True
             self.step = 0.0035
             self._t = 0.0
-            self._rings = []
+            self._items = []
             self._dims = (0, 0)
             self.bind("<Configure>", self._on_resize)
             self.after(50, self._tick)
@@ -1389,40 +1417,35 @@ if tk is not None:
             if (e.width, e.height) == self._dims or e.width < 10 or e.height < 10:
                 return
             self._dims = (e.width, e.height)
-            self.delete("orb")
-            self._rings = []
-            base = C["bg0"]
-            for col, size, *_ in self.ORBS:
-                ids = []
-                for k in range(9):
-                    t = k / 8
-                    ids.append(self.create_oval(0, 0, 1, 1, outline="", tags="orb",
-                                                fill=_mix(base, col, 0.06 + 0.30 * t * t)))
-                self._rings.append(ids)
-            self.tag_lower("orb")
+            self.delete("band")
+            w, h = self._dims
+            slant = h * 0.45                       # наклон полос
+            sw = (w + slant) / self.BANDS + 1
+            self._items = []
+            for i in range(self.BANDS):
+                x0 = i * sw - slant
+                x1 = x0 + sw + 1
+                self._items.append(self.create_polygon(
+                    x0 + slant, 0, x1 + slant, 0, x1, h, x0, h, fill=self.C_YELLOW, outline="", tags="band"))
+            self.tag_lower("band")
             self._paint()
 
         def _paint(self):
-            w, h = self._dims
-            for (col, size, ph, fx, fy, _a), ids in zip(self.ORBS, self._rings):
-                cx = w * (0.5 + 0.42 * math.sin(self._t * fx + ph))
-                cy = h * (0.45 + 0.38 * math.cos(self._t * fy + ph * 1.3))
-                R = max(w, h) * size
-                n = len(ids)
-                for k, item in enumerate(ids):
-                    r = R * (1 - k / n)
-                    self.coords(item, cx - r, cy - r, cx + r, cy + r)
+            n = len(self._items)
+            for i, item in enumerate(self._items):
+                k = 0.5 + 0.5 * math.sin(self._t + i * (2 * math.pi / n) * 1.0)
+                self.itemconfigure(item, fill=_mix(self.C_YELLOW, self.C_ORANGE, k))
 
         def _tick(self):
             try:
-                if self.enabled and self._rings and self.winfo_viewable():
+                if self.enabled and self._items and self.winfo_viewable():
                     self._t += self.step * 9
                     self._paint()
             finally:
                 self.after(40, self._tick)
 
     class AnimButton(tk.Canvas):
-        """Скруглённая кнопка: плавная смена цвета при наведении, «нажатие» и мягкая пульсация."""
+        """Пиксельная кнопка (форма как у «Скачать» на сайте), цвета лаунчера: жёлтая главная и тёмная обычная."""
         PRIMARY = ("ИГРАТЬ", "ВОЙТИ", "СОЗДАТЬ", "ИСКАТЬ", "СКАЧАТЬ", "ДОБАВИТЬ", "ИСПОЛЬЗОВАТЬ",
                    "СОХРАНИТЬ И ВОЙТИ", "ВЫБРАТЬ ДЛЯ ИГРЫ", "ВКЛЮЧИТЬ")
 
@@ -1495,35 +1518,70 @@ if tk is not None:
                 self.after(50, self._pulse_tick)
 
         def _draw(self):
+            """Форма как у кнопки «Скачать» на сайте: срезанные ступенчатые углы, светлая кромка сверху,
+            тёмная плашка снизу. Цвета — родные цвета лаунчера. Размеры пропорциональны высоте кнопки."""
             w, h = self._bw, self._bh
             bgc = self.cget("bg")
             self.delete("all")
+            hov = self._h if self._enabled else 0.0
             if self._primary:
-                top, bot, fg = C["yellow_hi"], C["yellow_lo"], C["brown"]
+                fill, hi, lo, fg = C["yellow"], C["yellow_hi"], C["yellow_lo"], C["brown"]
+                side = lo
                 if not self._enabled:
-                    top = bot = _mix(C["bg2"], C["muted"], 0.18)
-                    fg = C["muted"]
+                    fill = _mix(C["bg2"], C["muted"], 0.18)
+                    hi, lo, fg = _mix(fill, "#ffffff", 0.10), _mix(fill, "#000000", 0.30), C["muted"]
+                    side = lo
             else:
-                top, bot, fg = _mix(C["bg2"], "#ffffff", 0.07), C["bg2"], C["text"]
+                fill = _mix(C["bg2"], "#ffffff", 0.05)
+                edge = _mix(C["line"], C["violet"], hov)
+                hi, side, lo, fg = _mix(edge, "#ffffff", 0.12), edge, _mix(C["bg2"], "#000000", 0.45), C["text"]
                 if not self._enabled:
-                    top = bot = C["bg2"]
+                    fill = C["bg2"]
+                    hi = side = C["line"]
                     fg = C["muted"]
-            if self._enabled:
-                top, bot = _mix(top, "#ffffff", 0.18 * self._h), _mix(bot, "#ffffff", 0.10 * self._h)
-            inset = 1.5 if (self._down and self._enabled) else 0
+            if self._enabled:   # плавное осветление при наведении
+                fill, hi, lo = (_mix(c, "#ffffff", 0.14 * hov) for c in (fill, hi, lo))
+                if self._primary:
+                    side = lo
+            inset = 2 if (self._down and self._enabled) else 0
+            m = 3                                           # поле под свечение главной кнопки
             if self._primary and self._enabled and self._pulse and not self._hover:
                 g = (math.sin(self._ph) + 1) / 2
-                _rrect(self, 0, 0, w, h, 18, fill=_mix(bgc, C["yellow"], 0.08 + 0.20 * g), outline="")
+                glow = _mix(bgc, C["yellow"], 0.08 + 0.20 * g)
             elif self._primary and self._enabled and self._h > 0:
-                _rrect(self, 0, 0, w, h, 18, fill=_mix(bgc, C["yellow"], 0.26 * self._h), outline="")
-            x0, y0, x1, y1 = 3 + inset, 3 + inset, w - 3 - inset, h - 3 - inset
-            r = min(12, (y1 - y0) / 2)
-            _grad_rrect(self, x0, y0, x1, y1, r, top, bot)
-            if not self._primary:
-                _rrect(self, x0, y0, x1, y1, r, fill="",
-                       outline=_mix(C["line"], C["violet"], self._h) if self._enabled else C["line"])
-            f = font(self._fs, True)
-            self.create_text(w / 2, h / 2 + inset - 1, text=_nice(self._label), fill=fg, font=f)
+                glow = _mix(bgc, C["yellow"], 0.26 * self._h)
+            else:
+                glow = None
+
+            def shape(x0, y0, x1, y1, n):
+                return [x0, y0 + n, x0 + n, y0 + n, x0 + n, y0, x1 - n, y0, x1 - n, y0 + n, x1, y0 + n,
+                        x1, y1 - n, x1 - n, y1 - n, x1 - n, y1, x0 + n, y1, x0 + n, y1 - n, x0, y1 - n]
+
+            if glow:
+                self.create_polygon(shape(0, 0, w, h, 4), fill=glow, outline="")
+            x0, y0, x1, y1 = m, m + inset, w - m, h - m
+            bh = y1 - y0
+            k = bh / 56.0
+            n = max(3, round(6 * k))
+            top_h, bot_h = max(1, round(2 * k)), max(2, round(4 * k))
+            sd, px = max(1, round(2 * k)), max(2, round(3 * k))
+            self.create_polygon(shape(x0, y0, x1, y1, n), fill=fill, outline="")
+            cr = self.create_rectangle
+            cr(x0 + n, y0, x1 - n, y0 + top_h, fill=hi, outline="")              # верхняя кромка
+            cr(x0 + n, y1 - bot_h, x1 - n, y1, fill=lo, outline="")              # нижняя плашка
+            cr(x0, y0 + n, x0 + sd, y1 - n, fill=side, outline="")               # левый край
+            cr(x1 - sd, y0 + n, x1, y1 - n, fill=side, outline="")               # правый край
+            for x in (x0 + n, x1 - n - px):                                      # угловые «пиксели»
+                cr(x, y0 + n, x + px, y0 + n + px, fill=hi, outline="")
+                cr(x, y1 - n - px, x + px, y1 - n, fill=lo, outline="")
+            label = _nice(self._label)
+            size = max(10, round(h * 0.30))
+            while True:
+                f = (BTN_FONT, -size, "normal")
+                if size <= 8 or tkfont.Font(font=f).measure(label) <= (x1 - x0) - 2 * n - 10:
+                    break
+                size -= 1
+            self.create_text(w / 2, (y0 + y1) / 2 - 1, text=label, fill=fg, font=f)
 
     class ToggleSwitch(tk.Frame):
         """Переключатель: бегунок плавно скользит, цвет перетекает."""
@@ -2193,11 +2251,47 @@ class App:
         bar.configure(bg=_mix(bgc, C["yellow"], 1.0 if sel else 0.0), width=4)
 
     def show_page(self, key):
+        old = getattr(self, "_shown", None)
         self.page = key
-        self.pages[key].tkraise()
         self._style_nav()
         if key == "mods":
             self.sync_mods_target()
+        if old is None or old == key or not self.v_anim.get():
+            self._stop_slide()
+            self.pages[key].place_configure(relx=0.0)
+            self.pages[key].tkraise()
+            self._shown = key
+            return
+        self._slide_in(key)
+
+    def _stop_slide(self):
+        job = getattr(self, "_slide_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._slide_job = None
+        for p in self.pages.values():
+            p.place_configure(relx=0.0)
+
+    def _slide_in(self, key, dur=0.28):
+        """Новая страница плавно выезжает справа поверх прежней (ease-out)."""
+        self._stop_slide()
+        new = self.pages[key]
+        self._shown = key
+        new.place_configure(relx=1.0)
+        new.tkraise()
+        t0 = time.perf_counter()
+
+        def step():
+            t = min(1.0, (time.perf_counter() - t0) / dur)
+            new.place_configure(relx=(1 - t) ** 3)
+            if t < 1.0:
+                self._slide_job = self.root.after(15, step)
+            else:
+                self._slide_job = None
+        step()
 
     def _wheel(self, e):
         sf = self.scrolls.get(self.page)
@@ -2247,7 +2341,7 @@ class App:
         self.pages = {}
         for key, _t in self.NAV:
             p = tk.Frame(content, bg=C["bg1"])
-            p.grid(row=0, column=0, sticky="nsew")
+            p.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
             self.pages[key] = p
         self._build_home(self.pages["home"])
         self._build_builds(self.pages["builds"])
