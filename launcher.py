@@ -1505,6 +1505,14 @@ if tk is not None:
     HUB = GradHub()
 
     class GradFrame(tk.Canvas):
+        # --- fix: widget raise ---
+        def tkraise(self, aboveThis=None):
+            tk.Misc.tkraise(self, aboveThis)
+
+        def lift(self, aboveThis=None):
+            tk.Misc.lift(self, aboveThis)
+        # --- end fix ---
+
         """«Прозрачный» контейнер: рисует свой кусок общего градиента. Дочерние виджеты кладём как в Frame."""
 
         def __init__(self, master, **kw):
@@ -2563,7 +2571,8 @@ class App:
         self._skip_save = False
         self._sq = None
         self._busy_search = False
-        self._shown = 0
+        self._shown = None
+        self._res_shown = 0
         self._ensure_accounts()
 
         root.title(APP_NAME)
@@ -2922,7 +2931,7 @@ class App:
             pass
         cover = self._cover
         cover.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
-        cover.tkraise()
+        tk.Misc.tkraise(cover)
         t0 = time.perf_counter()
 
         def step():
@@ -3381,13 +3390,13 @@ class App:
         if not append:
             for w in body.winfo_children():
                 w.destroy()
-            self._shown = 0
+            self._res_shown = 0
         for it in items:
             self._result_row(body, it)
-        self._shown += len(items)
-        self._sq["offset"] = self._shown
-        self.more_btn.set_enabled(self._shown < total and bool(items))
-        self.mods_status(f"Найдено: {total}. Показано: {self._shown}" if (items or append)
+        self._res_shown += len(items)
+        self._sq["offset"] = self._res_shown
+        self.more_btn.set_enabled(self._res_shown < total and bool(items))
+        self.mods_status(f"Найдено: {total}. Показано: {self._res_shown}" if (items or append)
                          else "Ничего не найдено — попробуйте другой запрос или снимите фильтр версии")
 
     def _result_row(self, body, it):
